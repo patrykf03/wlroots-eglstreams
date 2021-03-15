@@ -1,0 +1,2722 @@
+diff --git a/.gitignore b/.gitignore
+index f635e54fe..2065be31c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -7,3 +7,7 @@ build/
+ build-*/
+ wayland-*-protocol.*
+ wlr-example.ini
++.cache/
++.vscode/
++compile_commands.json
++
+diff --git a/README.md b/README.md
+index 97e31b6ff..c912c5429 100644
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,41 @@
+-# wlroots
++# wlroots-wglstreams - NVidia EGLStreams support for popular wayland compositor library!
++
++Supported:
++```
++Add EGLStreams support for DRM backend
++
++Supported:
++1. Damage tracking
++2. EGLStreams buffer allocator
++3. VT switching, sleep/wakeup restoring
++4. Client's wayland GL texture import
++5. Multi-out
++
++Known issues
++1. Absence of Multi-GPU support. Due to lack of dma-buf (Nvidia's WIP)
++2. Screenshots through dma-buf (the same reason). TODO with another
++   approach if possible
++3. XWayland acceleration support (Nvidia's WIP)
++4. mpv works with `-vo gpu` only with --opengl-es=yes
++
++Note: All dma-buf extensions are disabled for EGLStreams mode.
++Else chrome/chromium and other apps relying on them fail to start.
++
++TIP: run mozilla with MOZ_ENABLE_WAYLAND=1, chrome with
++--enable-features=UseOzonePlatform --ozone-platform=wayland.
++```
++---
++**NOTE**
++This repo is to be constantly rebased upon original wlroots.
++Be sure before a rebuild to update your local copy
++either by recloning or:
++```
++cd wlroots-eglstreams
++git fetch
++git reset --hard origin/master
++```
++---
++
+ 
+ Pluggable, composable, unopinionated modules for building a [Wayland]
+ compositor; or about 50,000 lines of code you were going to write anyway.
+diff --git a/backend/drm/atomic.c b/backend/drm/atomic.c
+index 75c795251..4a9bdd8c0 100644
+--- a/backend/drm/atomic.c
++++ b/backend/drm/atomic.c
+@@ -139,8 +139,12 @@ static void set_plane_props(struct atomic *atom, struct wlr_drm_backend *drm,
+ 		goto error;
+ 	}
+ 
+-	uint32_t width = gbm_bo_get_width(fb->bo);
+-	uint32_t height = gbm_bo_get_height(fb->bo);
++	bool is_eglstreams = drm->is_eglstreams;
++
++	uint32_t width = is_eglstreams ?
++		(uint32_t)fb->wlr_buf->width : gbm_bo_get_width(fb->bo);
++	uint32_t height = is_eglstreams ?
++		(uint32_t)fb->wlr_buf->height : gbm_bo_get_height(fb->bo);
+ 
+ 	// The src_* properties are in 16.16 fixed point
+ 	atomic_add(atom, id, props->src_x, 0);
+diff --git a/backend/drm/backend.c b/backend/drm/backend.c
+index e09efb125..9add477aa 100644
+--- a/backend/drm/backend.c
++++ b/backend/drm/backend.c
+@@ -172,6 +172,7 @@ struct wlr_backend *wlr_drm_backend_create(struct wl_display *display,
+ 	if (parent != NULL) {
+ 		drm->parent = get_drm_backend_from_backend(parent);
+ 	}
++	drm->is_eglstreams = drm_is_eglstreams(dev->fd);
+ 
+ 	drm->dev_change.notify = handle_dev_change;
+ 	wl_signal_add(&dev->events.change, &drm->dev_change);
+diff --git a/backend/drm/drm.c b/backend/drm/drm.c
+index a74c9ca79..e5618ad95 100644
+--- a/backend/drm/drm.c
++++ b/backend/drm/drm.c
+@@ -192,7 +192,9 @@ static bool init_planes(struct wlr_drm_backend *drm) {
+ 
+ 		// We don't really care about overlay planes, as we don't support them
+ 		// yet.
+-		if (type == DRM_PLANE_TYPE_OVERLAY) {
++		if (type == DRM_PLANE_TYPE_OVERLAY ||
++			// HW cursors are not supported for EGLStreams
++			(drm->is_eglstreams && type == DRM_PLANE_TYPE_CURSOR)) {
+ 			drmModeFreePlane(plane);
+ 			continue;
+ 		}
+@@ -330,7 +332,16 @@ static void drm_plane_set_committed(struct wlr_drm_plane *plane) {
+ static bool drm_crtc_commit(struct wlr_drm_connector *conn, uint32_t flags) {
+ 	struct wlr_drm_backend *drm = conn->backend;
+ 	struct wlr_drm_crtc *crtc = conn->crtc;
+-	bool ok = drm->iface->crtc_commit(drm, conn, flags);
++
++	// Here, for EGLStreams, only modesetting is handled.
++	// Commit&Flip is done with EGL.
++	if (drm->is_eglstreams && (flags & DRM_MODE_PAGE_FLIP_EVENT)) {
++		wlr_egl_flip_eglstreams_page(&conn->output);
++	}
++	bool ok = drm->is_eglstreams && !crtc->pending_modeset;
++	if (!ok) {
++		ok = drm->iface->crtc_commit(drm, conn, flags);
++	}
+ 	if (ok && !(flags & DRM_MODE_ATOMIC_TEST_ONLY)) {
+ 		memcpy(&crtc->current, &crtc->pending, sizeof(struct wlr_drm_crtc_state));
+ 		drm_plane_set_committed(crtc->primary);
+@@ -407,6 +418,10 @@ static bool test_buffer(struct wlr_drm_connector *conn,
+ 		return false;
+ 	}
+ 
++	if (drm->is_eglstreams) {
++		return true;
++	}
++
+ 	struct wlr_dmabuf_attributes attribs;
+ 	if (!wlr_buffer_get_dmabuf(wlr_buffer, &attribs)) {
+ 		return false;
+@@ -484,6 +499,7 @@ static bool drm_connector_commit_buffer(struct wlr_output *output) {
+ 	struct wlr_drm_plane *plane = crtc->primary;
+ 
+ 	assert(output->pending.committed & WLR_OUTPUT_STATE_BUFFER);
++
+ 	switch (output->pending.buffer_type) {
+ 	case WLR_OUTPUT_STATE_BUFFER_RENDER:
+ 		if (!drm_plane_lock_surface(plane, drm)) {
+@@ -1346,6 +1362,14 @@ void scan_drm_connectors(struct wlr_drm_backend *drm) {
+ 
+ 			wlr_output_init(&wlr_conn->output, &drm->backend, &output_impl,
+ 				drm->display);
++			if (drm->is_eglstreams) {
++				wlr_log(WLR_INFO, "Forcing software cursors for EGLStreams mode");
++				wlr_conn->output.software_cursor_locks = 1;
++				// EGL vs DRM is 180 flipped
++				// FIXME: Is there a better way to do this?
++				wlr_conn->output.transform =
++					wlr_egl_normalize_output_transform(wlr_conn->output.transform);
++			}
+ 
+ 			memcpy(wlr_conn->output.name, wlr_conn->name,
+ 				sizeof(wlr_conn->output.name));
+@@ -1472,7 +1496,6 @@ static int mhz_to_nsec(int mhz) {
+ static void page_flip_handler(int fd, unsigned seq,
+ 		unsigned tv_sec, unsigned tv_usec, unsigned crtc_id, void *data) {
+ 	struct wlr_drm_backend *drm = data;
+-
+ 	bool found = false;
+ 	struct wlr_drm_connector *conn;
+ 	wl_list_for_each(conn, &drm->outputs, link) {
+@@ -1522,7 +1545,7 @@ static void page_flip_handler(int fd, unsigned seq,
+ 		/* The DRM backend guarantees that the presentation event will be for
+ 		 * the last submitted frame. */
+ 		.commit_seq = conn->output.commit_seq,
+-		.when = &present_time,
++		.when =  tv_sec == 0 && tv_usec == 0 ? NULL: &present_time,
+ 		.seq = seq,
+ 		.refresh = mhz_to_nsec(conn->output.refresh),
+ 		.flags = present_flags,
+@@ -1603,3 +1626,10 @@ void destroy_drm_connector(struct wlr_drm_connector *conn) {
+ 	wl_list_remove(&conn->link);
+ 	free(conn);
+ }
++
++bool drm_is_eglstreams(int drm_fd) {
++	drmVersion *version = drmGetVersion(drm_fd);
++	int is_eglstreams = strcmp(version->name, "nvidia-drm") == 0;
++	drmFreeVersion(version);
++	return is_eglstreams;
++}
+diff --git a/backend/drm/renderer.c b/backend/drm/renderer.c
+index 260d041f9..a74da028e 100644
+--- a/backend/drm/renderer.c
++++ b/backend/drm/renderer.c
+@@ -17,15 +17,17 @@
+ #include "render/gbm_allocator.h"
+ #include "render/swapchain.h"
+ #include "render/wlr_renderer.h"
++#include "render/eglstreams_allocator.h"
+ 
+ bool init_drm_renderer(struct wlr_drm_backend *drm,
+ 		struct wlr_drm_renderer *renderer) {
+ 	renderer->backend = drm;
+-
+-	renderer->gbm = gbm_create_device(drm->fd);
+-	if (!renderer->gbm) {
+-		wlr_log(WLR_ERROR, "Failed to create GBM device");
+-		return false;
++	if (!drm->is_eglstreams) {
++		renderer->gbm = gbm_create_device(drm->fd);
++		if (!renderer->gbm) {
++			wlr_log(WLR_ERROR, "Failed to create GBM device");
++			return false;
++		}
+ 	}
+ 
+ 	renderer->wlr_rend = wlr_renderer_autocreate_with_drm_fd(drm->fd);
+@@ -34,25 +36,36 @@ bool init_drm_renderer(struct wlr_drm_backend *drm,
+ 		goto error_gbm;
+ 	}
+ 
+-	int alloc_fd = fcntl(drm->fd, F_DUPFD_CLOEXEC, 0);
+-	if (alloc_fd < 0) {
+-		wlr_log_errno(WLR_ERROR, "fcntl(F_DUPFD_CLOEXEC) failed");
+-		goto error_wlr_rend;
+-	}
++	if (drm->is_eglstreams) {
++		renderer->allocator = wlr_eglstreams_allocator_create(drm);
++		if (renderer->allocator == NULL) {
++			goto error_allocator;
++		}
++		init_eglstream_controller(drm->display);
++	} else {
++		int alloc_fd = fcntl(drm->fd, F_DUPFD_CLOEXEC, 0);
++		if (alloc_fd < 0) {
++			wlr_log_errno(WLR_ERROR, "fcntl(F_DUPFD_CLOEXEC) failed");
++			goto error_wlr_rend;
++		}
+ 
+-	renderer->allocator = wlr_gbm_allocator_create(alloc_fd);
+-	if (renderer->allocator == NULL) {
+-		wlr_log(WLR_ERROR, "Failed to create allocator");
+-		close(alloc_fd);
+-		goto error_wlr_rend;
++		renderer->allocator = wlr_gbm_allocator_create(alloc_fd);
++		if (renderer->allocator == NULL) {
++			close(alloc_fd);
++			goto error_allocator;
++		}
+ 	}
+ 
+ 	return true;
+ 
++error_allocator:
++	wlr_log(WLR_ERROR, "Failed to create allocator");
+ error_wlr_rend:
+ 	wlr_renderer_destroy(renderer->wlr_rend);
+ error_gbm:
+-	gbm_device_destroy(renderer->gbm);
++	if(!drm->is_eglstreams) {
++		gbm_device_destroy(renderer->gbm);
++	}
+ 	return false;
+ }
+ 
+@@ -63,12 +76,15 @@ void finish_drm_renderer(struct wlr_drm_renderer *renderer) {
+ 
+ 	wlr_allocator_destroy(&renderer->allocator->base);
+ 	wlr_renderer_destroy(renderer->wlr_rend);
+-	gbm_device_destroy(renderer->gbm);
++	if(!renderer->backend->is_eglstreams) {
++		gbm_device_destroy(renderer->gbm);
++	}
+ }
+ 
+ static bool init_drm_surface(struct wlr_drm_surface *surf,
+ 		struct wlr_drm_renderer *renderer, uint32_t width, uint32_t height,
+-		const struct wlr_drm_format *drm_format) {
++		const struct wlr_drm_format *drm_format,
++		const struct wlr_drm_plane *plane) {
+ 	if (surf->width == width && surf->height == height) {
+ 		return true;
+ 	}
+@@ -83,7 +99,7 @@ static bool init_drm_surface(struct wlr_drm_surface *surf,
+ 	surf->swapchain = NULL;
+ 
+ 	surf->swapchain = wlr_swapchain_create(&renderer->allocator->base,
+-		width, height, drm_format);
++		width, height, drm_format, (void *)(unsigned long)plane->id);
+ 	if (surf->swapchain == NULL) {
+ 		wlr_log(WLR_ERROR, "Failed to create swapchain");
+ 		memset(surf, 0, sizeof(*surf));
+@@ -214,42 +230,51 @@ bool drm_plane_init_surface(struct wlr_drm_plane *plane,
+ 	if (!wlr_drm_format_set_has(&plane->formats, format, DRM_FORMAT_MOD_INVALID)) {
+ 		format = strip_alpha_channel(format);
+ 	}
+-	const struct wlr_drm_format *plane_format =
+-		wlr_drm_format_set_get(&plane->formats, format);
+-	if (plane_format == NULL) {
+-		wlr_log(WLR_ERROR, "Plane %"PRIu32" doesn't support format 0x%"PRIX32,
+-			plane->id, format);
+-		return false;
+-	}
++	struct wlr_drm_format *drm_format = NULL;
++	struct wlr_drm_format *format_implicit_modifier = NULL;
+ 
+-	const struct wlr_drm_format_set *render_formats =
+-		wlr_renderer_get_dmabuf_render_formats(drm->renderer.wlr_rend);
+-	if (render_formats == NULL) {
+-		wlr_log(WLR_ERROR, "Failed to get render formats");
+-		return false;
+-	}
+-	const struct wlr_drm_format *render_format =
+-		wlr_drm_format_set_get(render_formats, format);
+-	if (render_format == NULL) {
+-		wlr_log(WLR_ERROR, "Renderer doesn't support format 0x%"PRIX32,
+-			format);
+-		return false;
+-	}
++	if (drm->is_eglstreams) {
++		// EGLStreams format is defined indirectly
++		// No need to do complex things here
++		drm_format = calloc(1, sizeof(*drm_format));
++		memset(drm_format, 0, sizeof(*drm_format));
++		drm_format->format = format;
++	} else {
++		const struct wlr_drm_format *plane_format =
++			wlr_drm_format_set_get(&plane->formats, format);
++		if (plane_format == NULL) {
++			wlr_log(WLR_ERROR, "Plane %"PRIu32" doesn't support format 0x%"PRIX32,
++				plane->id, format);
++			return false;
++		}
+ 
+-	struct wlr_drm_format *format_implicit_modifier = NULL;
+-	if (!with_modifiers) {
+-		format_implicit_modifier = wlr_drm_format_create(format);
+-		render_format = format_implicit_modifier;
+-	}
+-
+-	struct wlr_drm_format *drm_format =
+-		wlr_drm_format_intersect(plane_format, render_format);
+-	if (drm_format == NULL) {
+-		wlr_log(WLR_ERROR,
+-			"Failed to intersect plane and render formats 0x%"PRIX32,
+-			format);
+-		free(format_implicit_modifier);
+-		return false;
++		const struct wlr_drm_format_set *render_formats =
++			wlr_renderer_get_dmabuf_render_formats(drm->renderer.wlr_rend);
++		if (render_formats == NULL) {
++			wlr_log(WLR_ERROR, "Failed to get render formats");
++			return false;
++		}
++		const struct wlr_drm_format *render_format =
++			wlr_drm_format_set_get(render_formats, format);
++		if (render_format == NULL) {
++			wlr_log(WLR_ERROR, "Renderer doesn't support format 0x%"PRIX32,
++				format);
++			return false;
++		}
++
++		if (!with_modifiers) {
++			format_implicit_modifier = wlr_drm_format_create(format);
++			render_format = format_implicit_modifier;
++		}
++
++		drm_format = wlr_drm_format_intersect(plane_format, render_format);
++		if (drm_format == NULL) {
++			wlr_log(WLR_ERROR,
++				"Failed to intersect plane and render formats 0x%"PRIX32,
++				format);
++			free(format_implicit_modifier);
++			return false;
++		}
+ 	}
+ 
+ 	drm_plane_finish_surface(plane);
+@@ -257,7 +282,7 @@ bool drm_plane_init_surface(struct wlr_drm_plane *plane,
+ 	bool ok = true;
+ 	if (!drm->parent) {
+ 		ok = init_drm_surface(&plane->surf, &drm->renderer,
+-			width, height, drm_format);
++			width, height, drm_format, plane);
+ 	} else {
+ 		struct wlr_drm_format *drm_format_linear = create_linear_format(format);
+ 		if (drm_format_linear == NULL) {
+@@ -267,11 +292,11 @@ bool drm_plane_init_surface(struct wlr_drm_plane *plane,
+ 		}
+ 
+ 		ok = init_drm_surface(&plane->surf, &drm->parent->renderer,
+-			width, height, drm_format_linear);
++			width, height, drm_format_linear, plane);
+ 		free(drm_format_linear);
+ 
+ 		if (ok && !init_drm_surface(&plane->mgpu_surf, &drm->renderer,
+-				width, height, drm_format)) {
++				width, height, drm_format, plane)) {
+ 			finish_drm_surface(&plane->surf);
+ 			ok = false;
+ 		}
+@@ -364,43 +389,89 @@ static void drm_fb_handle_wlr_buf_destroy(struct wl_listener *listener,
+ 	drm_fb_destroy(fb);
+ }
+ 
++static bool  
++create_dumb_fb(int drm_fd, uint32_t width, uint32_t height,
++		uint32_t *handle, uint32_t *id)
++{
++	struct drm_mode_destroy_dumb destroy_request = { 0 };
++	struct drm_mode_create_dumb create_request = { 0 };
++	create_request.width = width;
++	create_request.height = height;
++	create_request.bpp = 32; /* RGBX8888 */
++	*handle = 0;
++	*id = 0;
++
++	if (drmIoctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_request) < 0) {
++		wlr_log(WLR_INFO, "Failed ioctl to create dumb fb");
++		return false;
++	}
++
++	uint32_t fd;
++	if (drmModeAddFB(drm_fd, width, height, 24, 32, create_request.pitch, create_request.handle, &fd)) {
++		goto fail_add_fb;
++	}
++
++	*handle = create_request.handle;
++	*id = fd;
++
++	// No need to map and clear. It won't be displayed anyway.
++
++	return true;
++
++fail_add_fb:
++	wlr_log(WLR_INFO, "Failed to add dumb fb");
++	destroy_request.handle = create_request.handle;
++	drmIoctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_request);
++	return false;
++}
++
+ static struct wlr_drm_fb *drm_fb_create(struct wlr_drm_backend *drm,
+ 		struct wlr_buffer *buf, const struct wlr_drm_format_set *formats) {
+ 	struct wlr_drm_fb *fb = calloc(1, sizeof(*fb));
+ 	if (!fb) {
+ 		return NULL;
+ 	}
++	fb->backend = drm;
+ 
+-	struct wlr_dmabuf_attributes attribs;
+-	if (!wlr_buffer_get_dmabuf(buf, &attribs)) {
+-		wlr_log(WLR_ERROR, "Failed to get DMA-BUF from buffer");
+-		goto error_get_dmabuf;
+-	}
+-
+-	if (formats && !wlr_drm_format_set_has(formats, attribs.format,
+-			attribs.modifier)) {
+-		// The format isn't supported by the plane. Try stripping the alpha
+-		// channel, if any.
+-		uint32_t format = strip_alpha_channel(attribs.format);
+-		if (wlr_drm_format_set_has(formats, format, attribs.modifier)) {
+-			attribs.format = format;
+-		} else {
+-			wlr_log(WLR_ERROR, "Buffer format 0x%"PRIX32" cannot be scanned out",
+-				attribs.format);
++	if(drm->is_eglstreams) {
++		// EGLStreams do not use FBs directly to renderer.
++		// Though fake FB is needed for modesetting.
++		fb->bo = NULL;
++		if (!create_dumb_fb(drm->fd, buf->width, buf->height,
++				&fb->handle, &fb->id)) {
++			goto error_create_dumb_fb;
++		}
++	} else {
++		struct wlr_dmabuf_attributes attribs;
++		if (!wlr_buffer_get_dmabuf(buf, &attribs)) {
++			wlr_log(WLR_ERROR, "Failed to get DMA-BUF from buffer");
+ 			goto error_get_dmabuf;
+ 		}
+-	}
+-
+-	fb->bo = get_bo_for_dmabuf(drm->renderer.gbm, &attribs);
+-	if (!fb->bo) {
+-		wlr_log(WLR_ERROR, "Failed to import DMA-BUF in GBM");
+-		goto error_get_dmabuf;
+-	}
+-
+-	fb->id = get_fb_for_bo(fb->bo, drm->addfb2_modifiers);
+-	if (!fb->id) {
+-		wlr_log(WLR_ERROR, "Failed to import GBM BO in KMS");
+-		goto error_get_fb_for_bo;
++		if (formats && !wlr_drm_format_set_has(formats, attribs.format,
++				attribs.modifier)) {
++			// The format isn't supported by the plane. Try stripping the alpha
++			// channel, if any.
++			uint32_t format = strip_alpha_channel(attribs.format);
++			if (wlr_drm_format_set_has(formats, format, attribs.modifier)) {
++				attribs.format = format;
++			} else {
++				wlr_log(WLR_ERROR, "Buffer format 0x%"PRIX32" cannot be scanned out",
++					attribs.format);
++				goto error_get_dmabuf;
++			}
++		}
++	
++		fb->bo = get_bo_for_dmabuf(drm->renderer.gbm, &attribs);
++		if (!fb->bo) {
++			wlr_log(WLR_ERROR, "Failed to import DMA-BUF in GBM");
++			goto error_get_dmabuf;
++		}
++	
++		fb->id = get_fb_for_bo(fb->bo, drm->addfb2_modifiers);
++		if (!fb->id) {
++			wlr_log(WLR_ERROR, "Failed to import GBM BO in KMS");
++			goto error_get_fb_for_bo;
++		}
+ 	}
+ 
+ 	fb->wlr_buf = buf;
+@@ -415,6 +486,7 @@ static struct wlr_drm_fb *drm_fb_create(struct wlr_drm_backend *drm,
+ error_get_fb_for_bo:
+ 	gbm_bo_destroy(fb->bo);
+ error_get_dmabuf:
++error_create_dumb_fb:
+ 	free(fb);
+ 	return NULL;
+ }
+@@ -422,13 +494,28 @@ static struct wlr_drm_fb *drm_fb_create(struct wlr_drm_backend *drm,
+ void drm_fb_destroy(struct wlr_drm_fb *fb) {
+ 	wl_list_remove(&fb->link);
+ 	wl_list_remove(&fb->wlr_buf_destroy.link);
+-
+-	struct gbm_device *gbm = gbm_bo_get_device(fb->bo);
+-	if (drmModeRmFB(gbm_device_get_fd(gbm), fb->id) != 0) {
+-		wlr_log(WLR_ERROR, "drmModeRmFB failed");
++	
++	if (fb->backend->is_eglstreams && fb->handle) {
++		// Despite of FB being dumb it must be properly deallocated.
++		// nvidia driver won't do this for us even on process exit :-(.
++		// Ignoring this step will lead to driver out-of-resources eventually.
++		int drm_fd = fb->backend->fd;
++		struct drm_mode_destroy_dumb destroy_request = { fb->handle };
++		if (drmModeRmFB(drm_fd, fb->id) != 0) {
++			wlr_log(WLR_ERROR, "drmModeRmFB failed for EGLStream dumb FB");
++		}
++		if (destroy_request.handle &&
++			drmIoctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_request) != 0) {
++			wlr_log(WLR_ERROR, "drmIoctl destroy failed for EGLStream dumb FB");
++		}
++	} else if (fb->bo) {
++		struct gbm_device *gbm = gbm_bo_get_device(fb->bo);
++		if (drmModeRmFB(gbm_device_get_fd(gbm), fb->id) != 0) {
++			wlr_log(WLR_ERROR, "drmModeRmFB failed");
++		}
++		gbm_bo_destroy(fb->bo);
+ 	}
+ 
+-	gbm_bo_destroy(fb->bo);
+ 	free(fb);
+ }
+ 
+diff --git a/backend/headless/output.c b/backend/headless/output.c
+index 578876ea2..e62618364 100644
+--- a/backend/headless/output.c
++++ b/backend/headless/output.c
+@@ -26,7 +26,7 @@ static bool output_set_custom_mode(struct wlr_output *wlr_output, int32_t width,
+ 
+ 	wlr_swapchain_destroy(output->swapchain);
+ 	output->swapchain = wlr_swapchain_create(output->backend->allocator,
+-			width, height, output->backend->format);
++			width, height, output->backend->format, NULL);
+ 	if (!output->swapchain) {
+ 		wlr_output_destroy(wlr_output);
+ 		return false;
+@@ -191,7 +191,7 @@ struct wlr_output *wlr_headless_add_output(struct wlr_backend *wlr_backend,
+ 	struct wlr_output *wlr_output = &output->wlr_output;
+ 
+ 	output->swapchain = wlr_swapchain_create(backend->allocator,
+-		width, height, backend->format);
++		width, height, backend->format, NULL);
+ 	if (!output->swapchain) {
+ 		goto error;
+ 	}
+diff --git a/backend/wayland/output.c b/backend/wayland/output.c
+index b36af17bd..d64f09503 100644
+--- a/backend/wayland/output.c
++++ b/backend/wayland/output.c
+@@ -100,7 +100,8 @@ static bool output_set_custom_mode(struct wlr_output *wlr_output,
+ 
+ 	if (wlr_output->width != width || wlr_output->height != height) {
+ 		struct wlr_swapchain *swapchain = wlr_swapchain_create(
+-			output->backend->allocator, width, height, output->backend->format);
++			output->backend->allocator, width, height, output->backend->format,
++			NULL);
+ 		if (swapchain == NULL) {
+ 			return false;
+ 		}
+@@ -306,7 +307,6 @@ static bool output_commit(struct wlr_output *wlr_output) {
+ 		case WLR_OUTPUT_STATE_BUFFER_RENDER:
+ 			assert(output->back_buffer != NULL);
+ 			wlr_buffer = output->back_buffer;
+-
+ 			wlr_renderer_bind_buffer(output->backend->renderer, NULL);
+ 			break;
+ 		case WLR_OUTPUT_STATE_BUFFER_SCANOUT:;
+@@ -410,7 +410,7 @@ static bool output_set_cursor(struct wlr_output *wlr_output,
+ 			wlr_swapchain_destroy(output->cursor.swapchain);
+ 			output->cursor.swapchain = wlr_swapchain_create(
+ 				output->backend->allocator, width, height,
+-				output->backend->format);
++				output->backend->format, NULL);
+ 			if (output->cursor.swapchain == NULL) {
+ 				return false;
+ 			}
+@@ -653,7 +653,8 @@ struct wlr_output *wlr_wl_output_create(struct wlr_backend *wlr_backend) {
+ 	wl_surface_commit(output->surface);
+ 
+ 	output->swapchain = wlr_swapchain_create(output->backend->allocator,
+-		wlr_output->width, wlr_output->height, output->backend->format);
++		wlr_output->width, wlr_output->height, output->backend->format,
++		NULL);
+ 	if (output->swapchain == NULL) {
+ 		goto error;
+ 	}
+diff --git a/backend/x11/output.c b/backend/x11/output.c
+index 0d045ff49..fbc09af42 100644
+--- a/backend/x11/output.c
++++ b/backend/x11/output.c
+@@ -389,7 +389,7 @@ static bool output_cursor_to_picture(struct wlr_x11_output *output,
+ 		wlr_swapchain_destroy(output->cursor.swapchain);
+ 		output->cursor.swapchain = wlr_swapchain_create(
+ 			x11->allocator, width, height,
+-			x11->drm_format);
++			x11->drm_format, NULL);
+ 		if (output->cursor.swapchain == NULL) {
+ 			return false;
+ 		}
+@@ -562,7 +562,7 @@ struct wlr_output *wlr_x11_output_create(struct wlr_backend *backend) {
+ 	wlr_output_update_custom_mode(wlr_output, 1024, 768, 0);
+ 
+ 	output->swapchain = wlr_swapchain_create(x11->allocator,
+-		wlr_output->width, wlr_output->height, x11->drm_format);
++		wlr_output->width, wlr_output->height, x11->drm_format, NULL);
+ 	if (!output->swapchain) {
+ 		wlr_log(WLR_ERROR, "Failed to create swapchain");
+ 		free(output);
+@@ -665,7 +665,7 @@ void handle_x11_configure_notify(struct wlr_x11_output *output,
+ 			output->swapchain->height != ev->height) {
+ 		struct wlr_swapchain *swapchain = wlr_swapchain_create(
+ 			output->x11->allocator, ev->width, ev->height,
+-			output->x11->drm_format);
++			output->x11->drm_format, NULL);
+ 		if (!swapchain) {
+ 			return;
+ 		}
+diff --git a/include/backend/drm/drm.h b/include/backend/drm/drm.h
+index 42680d742..1c934577c 100644
+--- a/include/backend/drm/drm.h
++++ b/include/backend/drm/drm.h
+@@ -93,6 +93,7 @@ struct wlr_drm_backend {
+ 
+ 	struct wlr_drm_renderer renderer;
+ 	struct wlr_session *session;
++	bool is_eglstreams;
+ };
+ 
+ enum wlr_drm_connector_state {
+@@ -158,6 +159,8 @@ size_t drm_crtc_get_gamma_lut_size(struct wlr_drm_backend *drm,
+ 
+ struct wlr_drm_fb *plane_get_next_fb(struct wlr_drm_plane *plane);
+ 
++bool drm_is_eglstreams(int drm_fd);
++
+ #define wlr_drm_conn_log(conn, verb, fmt, ...) \
+ 	wlr_log(verb, "connector %s: " fmt, conn->name, ##__VA_ARGS__)
+ #define wlr_drm_conn_log_errno(conn, verb, fmt, ...) \
+diff --git a/include/backend/drm/renderer.h b/include/backend/drm/renderer.h
+index 2abd9dcad..276e014a1 100644
+--- a/include/backend/drm/renderer.h
++++ b/include/backend/drm/renderer.h
+@@ -36,6 +36,9 @@ struct wlr_drm_fb {
+ 	struct gbm_bo *bo;
+ 	uint32_t id;
+ 
++	struct wlr_drm_backend *backend;
++	uint32_t handle;
++
+ 	struct wl_listener wlr_buf_destroy;
+ };
+ 
+diff --git a/include/render/allocator.h b/include/render/allocator.h
+index d47184af1..717c0ec40 100644
+--- a/include/render/allocator.h
++++ b/include/render/allocator.h
+@@ -10,7 +10,8 @@ struct wlr_allocator;
+ 
+ struct wlr_allocator_interface {
+ 	struct wlr_buffer *(*create_buffer)(struct wlr_allocator *alloc,
+-		int width, int height, const struct wlr_drm_format *format);
++		int width, int height, const struct wlr_drm_format *format,
++		void *data);
+ 	void (*destroy)(struct wlr_allocator *alloc);
+ };
+ 
+@@ -33,7 +34,7 @@ void wlr_allocator_destroy(struct wlr_allocator *alloc);
+  * wlr_buffer_drop.
+  */
+ struct wlr_buffer *wlr_allocator_create_buffer(struct wlr_allocator *alloc,
+-	int width, int height, const struct wlr_drm_format *format);
++	int width, int height, const struct wlr_drm_format *format, void *data);
+ 
+ // For wlr_allocator implementors
+ void wlr_allocator_init(struct wlr_allocator *alloc,
+diff --git a/include/render/eglstreams_allocator.h b/include/render/eglstreams_allocator.h
+new file mode 100644
+index 000000000..2a69a6777
+--- /dev/null
++++ b/include/render/eglstreams_allocator.h
+@@ -0,0 +1,50 @@
++
++#ifndef RENDER_EGLSTREAM_ALLOCATOR_H
++#define RENDER_EGLSTREAM_ALLOCATOR_H
++
++#include <wlr/types/wlr_buffer.h>
++#include "render/allocator.h"
++#include "wlr/render/egl.h"
++#include "render/gbm_allocator.h"
++
++
++struct wlr_eglstreams_allocator;
++
++struct wlr_eglstream_plane {
++	struct wlr_eglstream stream;
++	uint32_t id;
++	struct wl_list link; // wlr_eglstreams_allocator.planes
++	uint32_t locks;
++	struct wlr_eglstreams_allocator *alloc;
++	int width;
++	int height;
++};
++
++struct wlr_eglstream_buffer {
++	struct wlr_buffer base;
++	struct wlr_eglstream_plane *plane;
++};
++
++struct wlr_eglstreams_allocator {
++	// Dumb gdb allocator just not to change the rest of api
++	struct wlr_gbm_allocator base_gbm;
++
++	struct wlr_drm_backend *drm;
++	struct wl_list planes;
++};
++
++/**
++ * Creates a new EGLStreams allocator from a DRM Renderer.
++ * TODO: All creators should return generic wlr_allocator.
++ */
++struct wlr_gbm_allocator *
++	wlr_eglstreams_allocator_create(struct wlr_drm_backend *drm);
++
++/**
++ * Returns configured plane for given id if any.
++ */
++struct wlr_eglstream_plane *wlr_eglstream_plane_for_id(
++		struct wlr_allocator *wlr_alloc, uint32_t plane_id);
++
++#endif
++
+diff --git a/include/render/gles2.h b/include/render/gles2.h
+index 8b4de5a2f..b6e2c0a39 100644
+--- a/include/render/gles2.h
++++ b/include/render/gles2.h
+@@ -78,6 +78,7 @@ struct wlr_gles2_renderer {
+ 
+ 	struct wlr_gles2_buffer *current_buffer;
+ 	uint32_t viewport_width, viewport_height;
++	struct wl_list client_streams; //wlr_egl_client_stream.link
+ };
+ 
+ struct wlr_gles2_buffer {
+@@ -102,7 +103,9 @@ struct wlr_gles2_texture {
+ 	GLenum target;
+ 	GLuint tex;
+ 
++	// Either of two is non-null
+ 	EGLImageKHR image;
++	EGLStreamKHR stream;
+ 
+ 	bool inverted_y;
+ 	bool has_alpha;
+@@ -111,6 +114,16 @@ struct wlr_gles2_texture {
+ 	uint32_t drm_format; // used to interpret upload data
+ };
+ 
++struct  wlr_egl_client_stream {
++	struct wlr_gles2_renderer *renderer;
++	GLuint tex;
++	EGLStreamKHR stream;
++	bool acquired;
++	struct wl_resource* resource;
++	struct wl_list link; // wlr_gles2_renderer client_streams
++	struct wl_listener destroy_listener;
++};
++
+ const struct wlr_gles2_pixel_format *get_gles2_format_from_drm(uint32_t fmt);
+ const struct wlr_gles2_pixel_format *get_gles2_format_from_gl(
+ 	GLint gl_format, GLint gl_type, bool alpha);
+@@ -128,6 +141,8 @@ struct wlr_texture *gles2_texture_from_wl_drm(struct wlr_renderer *wlr_renderer,
+ 	struct wl_resource *data);
+ struct wlr_texture *gles2_texture_from_dmabuf(struct wlr_renderer *wlr_renderer,
+ 	struct wlr_dmabuf_attributes *attribs);
++struct wlr_texture *gles2_texture_from_wl_eglstream(struct wlr_renderer *wlr_renderer,
++	struct wl_resource *data);
+ 
+ void push_gles2_debug_(struct wlr_gles2_renderer *renderer,
+ 	const char *file, const char *func);
+diff --git a/include/render/swapchain.h b/include/render/swapchain.h
+index 243f0404c..789541bf2 100644
+--- a/include/render/swapchain.h
++++ b/include/render/swapchain.h
+@@ -20,6 +20,7 @@ struct wlr_swapchain {
+ 
+ 	int width, height;
+ 	struct wlr_drm_format *format;
++	void *backend_data;
+ 
+ 	struct wlr_swapchain_slot slots[WLR_SWAPCHAIN_CAP];
+ 
+@@ -28,7 +29,7 @@ struct wlr_swapchain {
+ 
+ struct wlr_swapchain *wlr_swapchain_create(
+ 	struct wlr_allocator *alloc, int width, int height,
+-	const struct wlr_drm_format *format);
++	const struct wlr_drm_format *format, void *backend_data);
+ void wlr_swapchain_destroy(struct wlr_swapchain *swapchain);
+ /**
+  * Acquire a buffer from the swap chain.
+diff --git a/include/wlr/render/egl.h b/include/wlr/render/egl.h
+index 9a5bc76b1..b392a8f15 100644
+--- a/include/wlr/render/egl.h
++++ b/include/wlr/render/egl.h
+@@ -29,6 +29,41 @@
+ #include <wlr/render/dmabuf.h>
+ #include <wlr/render/drm_format_set.h>
+ 
++#ifndef EGL_NV_stream_attrib
++#define EGL_NV_stream_attrib 1
++typedef EGLStreamKHR (EGLAPIENTRYP PFNEGLCREATESTREAMATTRIBNVPROC)(EGLDisplay dpy, const EGLAttrib *attrib_list);
++typedef EGLBoolean (EGLAPIENTRYP PFNEGLSETSTREAMATTRIBNVPROC)(EGLDisplay dpy, EGLStreamKHR stream, EGLenum attribute, EGLAttrib value);
++typedef EGLBoolean (EGLAPIENTRYP PFNEGLQUERYSTREAMATTRIBNVPROC)(EGLDisplay dpy, EGLStreamKHR stream, EGLenum attribute, EGLAttrib *value);
++typedef EGLBoolean (EGLAPIENTRYP PFNEGLSTREAMCONSUMERACQUIREATTRIBNVPROC)(EGLDisplay dpy, EGLStreamKHR stream, const EGLAttrib *attrib_list);
++typedef EGLBoolean (EGLAPIENTRYP PFNEGLSTREAMCONSUMERRELEASEATTRIBNVPROC)(EGLDisplay dpy, EGLStreamKHR stream, const EGLAttrib *attrib_list);
++typedef EGLBoolean (EGLAPIENTRYP PFNEGLQUERYSTREAMATTRIBNV)(EGLDisplay, EGLStreamKHR, EGLenum, EGLAttrib *);
++typedef EGLBoolean (EGLAPIENTRYP PFNEGLSTREAMCONSUMERRELEASEKHR)(EGLDisplay, EGLStreamKHR);
++#endif /* EGL_NV_stream_attrib */
++
++#ifndef EGL_EXT_stream_acquire_mode
++#define EGL_EXT_stream_acquire_mode 1
++#define EGL_CONSUMER_AUTO_ACQUIRE_EXT 0x332B
++typedef EGLBoolean (EGLAPIENTRYP PFNEGLSTREAMCONSUMERACQUIREATTRIBEXTPROC)(EGLDisplay dpy, EGLStreamKHR stream, const EGLAttrib *attrib_list);
++#endif /* EGL_EXT_stream_acquire_mode */
++
++#ifndef EGL_NV_output_drm_flip_event
++#define EGL_NV_output_drm_flip_event 1
++#define EGL_DRM_FLIP_EVENT_DATA_NV 0x333E
++#endif /* EGL_NV_output_drm_flip_event */
++
++#ifndef EGL_DRM_MASTER_FD_EXT
++#define EGL_DRM_MASTER_FD_EXT 0x333C
++#endif /* EGL_DRM_MASTER_FD_EXT */
++
++#ifndef EGL_WL_wayland_eglstream
++#define EGL_WL_wayland_eglstream 1
++#define EGL_WAYLAND_EGLSTREAM_WL 0x334B
++#endif /* EGL_WL_wayland_eglstream */
++
++#ifndef EGL_RESOURCE_BUSY_EXT
++#define EGL_RESOURCE_BUSY_EXT 0x3353
++#endif /* EGL_RESOURCE_BUSY_EXT */
++
+ struct wlr_egl_context {
+ 	EGLDisplay display;
+ 	EGLContext context;
+@@ -36,11 +71,21 @@ struct wlr_egl_context {
+ 	EGLSurface read_surface;
+ };
+ 
++struct wlr_eglstream {
++	struct wlr_drm_backend *drm;
++	struct wlr_egl *egl;
++	EGLStreamKHR stream;
++	EGLSurface surface;
++	bool busy; // true for e.g. modeset in progress
++};
++
+ struct wlr_egl {
+ 	EGLDisplay display;
+ 	EGLContext context;
+ 	EGLDeviceEXT device; // may be EGL_NO_DEVICE_EXT
+ 	struct gbm_device *gbm_device;
++	EGLConfig egl_config; // For setting up EGLStreams context
++	struct wlr_eglstream *current_eglstream; // Non-null for EGLStream frame
+ 
+ 	struct {
+ 		// Display extensions
+@@ -68,6 +113,19 @@ struct wlr_egl {
+ 		PFNEGLDEBUGMESSAGECONTROLKHRPROC eglDebugMessageControlKHR;
+ 		PFNEGLQUERYDISPLAYATTRIBEXTPROC eglQueryDisplayAttribEXT;
+ 		PFNEGLQUERYDEVICESTRINGEXTPROC eglQueryDeviceStringEXT;
++		// EGLStreams
++		PFNEGLQUERYDEVICESEXTPROC eglQueryDevicesEXT;
++		PFNEGLGETOUTPUTLAYERSEXTPROC eglGetOutputLayersEXT;
++		PFNEGLCREATESTREAMKHRPROC eglCreateStreamKHR;
++		PFNEGLDESTROYSTREAMKHRPROC eglDestroyStreamKHR;
++		PFNEGLSTREAMCONSUMEROUTPUTEXTPROC eglStreamConsumerOutputEXT;
++		PFNEGLCREATESTREAMPRODUCERSURFACEKHRPROC eglCreateStreamProducerSurfaceKHR;
++		PFNEGLSTREAMCONSUMERACQUIREATTRIBNVPROC eglStreamConsumerAcquireAttribNV;
++		PFNEGLQUERYSTREAMATTRIBNV eglQueryStreamAttribNV;
++		PFNEGLSTREAMCONSUMERRELEASEKHR eglStreamConsumerReleaseKHR;
++		PFNEGLQUERYSTREAMKHRPROC eglQueryStreamKHR;
++		PFNEGLCREATESTREAMATTRIBNVPROC eglCreateStreamAttribNV;
++		PFNEGLSTREAMCONSUMERGLTEXTUREEXTERNALKHRPROC eglStreamConsumerGLTextureExternalKHR;
+ 	} procs;
+ 
+ 	struct wl_display *wl_display;
+@@ -155,4 +213,35 @@ bool wlr_egl_restore_context(struct wlr_egl_context *context);
+ 
+ int wlr_egl_dup_drm_fd(struct wlr_egl *egl);
+ 
++/**
++ * Sets up EGLSurface for passed egl_stream
++ * Expects egl_stream->drm and egl_stream->egl to be valid
++ */
++bool wlr_egl_create_eglstreams_surface(struct wlr_eglstream *egl_stream,
++		uint32_t plane_id, int width, int height);
++
++/**
++ * Destroys egl_stream and frees resources used
++ */
++void wlr_egl_destroy_eglstreams_surface(struct wlr_eglstream *egl_stream);
++
++/**
++ * Flips EGLStream for presentation. Updated buffers ages.
++ * Expects EGLStream surface to be current
++ */
++struct wlr_output;
++bool wlr_egl_flip_eglstreams_page(struct wlr_output *output);
++
++/**
++ * Flips source transform around X axis to match EGL co-ordinate system.
++ */
++enum wl_output_transform
++wlr_egl_normalize_output_transform(enum wl_output_transform source_transform);
++
++/**
++ * Load and initialized nvidia eglstream controller.
++ * for mapping client EGL surfaces.
++ */
++void init_eglstream_controller(struct wl_display *display);
++
+ #endif
+diff --git a/include/wlr/render/gles2.h b/include/wlr/render/gles2.h
+index 5a3e9d5c7..1070fda07 100644
+--- a/include/wlr/render/gles2.h
++++ b/include/wlr/render/gles2.h
+@@ -17,7 +17,6 @@ struct wlr_egl;
+ 
+ struct wlr_renderer *wlr_gles2_renderer_create(struct wlr_egl *egl);
+ 
+-struct wlr_egl *wlr_gles2_renderer_get_egl(struct wlr_renderer *renderer);
+ bool wlr_gles2_renderer_check_ext(struct wlr_renderer *renderer,
+ 	const char *ext);
+ 
+@@ -33,4 +32,6 @@ bool wlr_texture_is_gles2(struct wlr_texture *texture);
+ void wlr_gles2_texture_get_attribs(struct wlr_texture *texture,
+ 	struct wlr_gles2_texture_attribs *attribs);
+ 
++struct wlr_egl *gles2_renderer_get_egl(struct wlr_renderer *renderer);
++
+ #endif
+diff --git a/include/wlr/render/interface.h b/include/wlr/render/interface.h
+index fbf17dea6..da451c911 100644
+--- a/include/wlr/render/interface.h
++++ b/include/wlr/render/interface.h
+@@ -61,6 +61,9 @@ struct wlr_renderer_impl {
+ 		struct wlr_dmabuf_attributes *dst,
+ 		struct wlr_dmabuf_attributes *src);
+ 	int (*get_drm_fd)(struct wlr_renderer *renderer);
++	struct wlr_texture *(*texture_from_wl_eglstream)(struct wlr_renderer *renderer,
++		struct wl_resource *data);
++	struct wlr_egl *(*get_egl)(struct wlr_renderer *renderer);
+ };
+ 
+ void wlr_renderer_init(struct wlr_renderer *renderer,
+diff --git a/include/wlr/render/wlr_renderer.h b/include/wlr/render/wlr_renderer.h
+index 96268e38e..b7e588a1b 100644
+--- a/include/wlr/render/wlr_renderer.h
++++ b/include/wlr/render/wlr_renderer.h
+@@ -139,4 +139,14 @@ int wlr_renderer_get_drm_fd(struct wlr_renderer *r);
+  */
+ void wlr_renderer_destroy(struct wlr_renderer *renderer);
+ 
++/**
++ * Gets underlying wlr_elg if defined.
++ */
++struct wlr_egl *wlr_renderer_get_egl(struct wlr_renderer *renderer);
++
++/**
++ * Gets the parameters of wayland buffer.
++ */
++bool wlr_renderer_wl_buffer_get_params(struct wlr_renderer *renderer,
++	struct wl_resource *buffer, int *width, int *height, int *inverted_y);
+ #endif
+diff --git a/include/wlr/render/wlr_texture.h b/include/wlr/render/wlr_texture.h
+index 4949d1353..80f37328f 100644
+--- a/include/wlr/render/wlr_texture.h
++++ b/include/wlr/render/wlr_texture.h
+@@ -51,6 +51,16 @@ struct wlr_texture *wlr_texture_from_wl_drm(struct wlr_renderer *renderer,
+ struct wlr_texture *wlr_texture_from_dmabuf(struct wlr_renderer *renderer,
+ 	struct wlr_dmabuf_attributes *attribs);
+ 
++/**
++ * Create a new texture from a EGLSTREAM_WL resource. The returned texture is
++ * immutable.
++ *
++ * Should not be called in a rendering block like renderer_begin()/end() or
++ * between attaching a renderer to an output and committing it.
++ */
++struct wlr_texture *wlr_texture_from_wl_eglstream(struct wlr_renderer *renderer,
++	struct wl_resource *data);
++
+ /**
+  * Get the texture width and height.
+  *
+diff --git a/include/wlr/types/wlr_buffer.h b/include/wlr/types/wlr_buffer.h
+index 845558999..48b64ed0d 100644
+--- a/include/wlr/types/wlr_buffer.h
++++ b/include/wlr/types/wlr_buffer.h
+@@ -12,6 +12,7 @@
+ #include <pixman.h>
+ #include <wayland-server-core.h>
+ #include <wlr/render/dmabuf.h>
++#include <wlr/render/egl.h>
+ 
+ struct wlr_buffer;
+ 
+@@ -41,6 +42,9 @@ struct wlr_buffer {
+ 		struct wl_signal destroy;
+ 		struct wl_signal release;
+ 	} events;
++
++	// Non-null for EGLStreams
++	struct wlr_eglstream *egl_stream;
+ };
+ 
+ /**
+diff --git a/include/wlr/types/wlr_surface.h b/include/wlr/types/wlr_surface.h
+index ef2f2dac4..c180fae9c 100644
+--- a/include/wlr/types/wlr_surface.h
++++ b/include/wlr/types/wlr_surface.h
+@@ -140,6 +140,9 @@ struct wlr_surface {
+ 	struct wl_listener renderer_destroy;
+ 
+ 	void *data;
++
++	// To handle transform y flipping
++	bool is_eglstream;
+ };
+ 
+ struct wlr_subsurface_state {
+diff --git a/meson.build b/meson.build
+index 012fed3af..d929624f8 100644
+--- a/meson.build
++++ b/meson.build
+@@ -19,6 +19,8 @@ soversion = 7
+ 
+ add_project_arguments([
+ 	'-DWLR_USE_UNSTABLE',
++	# Allow clients to die on their own, be not so strict
++	'-DWLR_RELAXED_CLIENT_HANDLING'
+ ], language: 'c')
+ 
+ cc = meson.get_compiler('c')
+@@ -104,6 +106,7 @@ udev = dependency('libudev')
+ pixman = dependency('pixman-1')
+ math = cc.find_library('m')
+ rt = cc.find_library('rt')
++dlfcn = cc.find_library('dl') # for libnvidia-egl-wayland.so.1 dynamic loading
+ 
+ if not get_option('xdg-foreign').disabled()
+ 	uuid = dependency('uuid', required: false)
+@@ -131,6 +134,7 @@ wlr_deps = [
+ 	pixman,
+ 	math,
+ 	rt,
++	dlfcn
+ ]
+ 
+ subdir('protocol')
+diff --git a/protocol/meson.build b/protocol/meson.build
+index a602cd1d8..89704f768 100644
+--- a/protocol/meson.build
++++ b/protocol/meson.build
+@@ -47,6 +47,8 @@ protocols = {
+ 	'wlr-output-power-management-unstable-v1': 'wlr-output-power-management-unstable-v1.xml',
+ 	'wlr-screencopy-unstable-v1': 'wlr-screencopy-unstable-v1.xml',
+ 	'wlr-virtual-pointer-unstable-v1': 'wlr-virtual-pointer-unstable-v1.xml',
++	# Nvidia eglstrem controller (for client egl functionality)
++	'wl_eglstream_controller': 'wayland-eglstream-controller.xml',
+ }
+ 
+ protocols_code = {}
+diff --git a/protocol/wayland-eglstream-controller.xml b/protocol/wayland-eglstream-controller.xml
+new file mode 100644
+index 000000000..31050ab02
+--- /dev/null
++++ b/protocol/wayland-eglstream-controller.xml
+@@ -0,0 +1,71 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="wl_eglstream_controller">
++  <copyright>
++    SPDX-FileCopyrightText: 2017-2018, NVIDIA CORPORATION. All rights reserved.
++
++    SPDX-License-Identifier: MIT
++  </copyright>
++  <interface name="wl_eglstream_controller" version="2">
++    <!-- Present mode types. This enum defines what the present mode given
++         to a attach_eglstream_consumer_attribs request represents -->
++    <enum name="present_mode">
++      <description summary="Stream present mode">
++          - dont_care: Using this enum will tell the server to make its own
++                       decisions regarding present mode.
++
++          - fifo:      Tells the server to use a fifo present mode. The decision to
++                       use fifo synchronous is left up to the server.
++
++          - mailbox:   Tells the server to use a mailbox present mode.
++      </description>
++      <entry name="dont_care" value="0" summary="Let the Server decide present mode"/>
++      <entry name="fifo" value="1" summary="Use a fifo present mode"/>
++      <entry name="mailbox" value="2" summary="Use a mailbox mode"/>
++    </enum>
++
++    <enum name="attrib">
++      <description summary="Stream consumer attachment attributes">
++          - present_mode: Must be one of wl_eglstream_controller_present_mode. Tells the
++                          server the desired present mode that should be used.
++
++          - fifo_length:  Only valid when the present_mode attrib is provided and its
++                          value is specified as fifo. Tells the server the desired fifo
++                          length to be used when the desired present_mode is fifo.
++      </description>
++      <entry name="present_mode" value="0" summary="Tells the server the desired present mode"/>
++      <entry name="fifo_length" value="1" summary="Tells the server the desired fifo length when the desired presenation_mode is fifo."/>
++    </enum>
++
++    <request name="attach_eglstream_consumer" since="1">
++      <description summary="Create server stream and attach consumer">
++        Creates the corresponding server side EGLStream from the given wl_buffer
++        and attaches a consumer to it.
++      </description>
++      <arg name="wl_surface" type="object" interface="wl_surface"
++        summary="wl_surface corresponds to the client surface associated with
++        newly created eglstream"/>
++      <arg name="wl_resource" type="object" interface="wl_buffer"
++        summary="wl_resource corresponding to an EGLStream"/>
++    </request>
++
++    <request name="attach_eglstream_consumer_attribs" since="2">
++      <description summary="Create server stream and attach consumer using attributes">
++        Creates the corresponding server side EGLStream from the given wl_buffer
++        and attaches a consumer to it using the given attributes.
++      </description>
++      <arg name="wl_surface" type="object" interface="wl_surface"
++        summary="wl_surface corresponds to the client surface associated with
++        newly created eglstream"/>
++      <arg name="wl_resource" type="object" interface="wl_buffer"
++        summary="wl_resource corresponding to an EGLStream"/>
++      <arg name="attribs" type="array"
++        summary="Stream consumer attachment attribs">
++        <description summary="List of attributes with consumer attachment data">
++          It contains key-value pairs compatible with intptr_t type. A key must
++          be one of wl_eglstream_controller_attrib enumeration values. What a value
++          represents is attribute-specific.
++        </description>
++      </arg>
++    </request>
++  </interface>
++</protocol>
+diff --git a/render/allocator.c b/render/allocator.c
+index ea1712e96..8b61c178c 100644
+--- a/render/allocator.c
++++ b/render/allocator.c
+@@ -18,6 +18,6 @@ void wlr_allocator_destroy(struct wlr_allocator *alloc) {
+ }
+ 
+ struct wlr_buffer *wlr_allocator_create_buffer(struct wlr_allocator *alloc,
+-		int width, int height, const struct wlr_drm_format *format) {
+-	return alloc->impl->create_buffer(alloc, width, height, format);
++		int width, int height, const struct wlr_drm_format *format, void *data) {
++	return alloc->impl->create_buffer(alloc, width, height, format, data);
+ }
+diff --git a/render/egl.c b/render/egl.c
+index 556762949..d0e6fdd06 100644
+--- a/render/egl.c
++++ b/render/egl.c
+@@ -10,8 +10,24 @@
+ #include <wlr/util/log.h>
+ #include <wlr/util/region.h>
+ #include <xf86drm.h>
++#include <dlfcn.h>
++#include <wlr/types/wlr_surface.h>
++#include "backend/drm/drm.h"
++#include "render/swapchain.h"
++#include "render/eglstreams_allocator.h"
++#include "wayland-eglstream-controller-protocol.h"
++
++static enum wlr_log_importance egl_log_importance_to_wlr(EGLint type,
++		EGLint error) {
++	switch (error) {
++		// Do not spam about EGLStream errors
++		case EGL_BAD_STATE_KHR:
++		case EGL_BAD_STREAM_KHR:
++			return WLR_DEBUG;
++		default:
++			break;
++	}
+ 
+-static enum wlr_log_importance egl_log_importance_to_wlr(EGLint type) {
+ 	switch (type) {
+ 	case EGL_DEBUG_MSG_CRITICAL_KHR: return WLR_ERROR;
+ 	case EGL_DEBUG_MSG_ERROR_KHR:    return WLR_ERROR;
+@@ -55,13 +71,17 @@ static const char *egl_error_str(EGLint error) {
+ 		return "EGL_BAD_NATIVE_WINDOW";
+ 	case EGL_CONTEXT_LOST:
+ 		return "EGL_CONTEXT_LOST";
++	case EGL_BAD_STREAM_KHR:
++		return "EGL_BAD_STREAM_KHR";
++	case EGL_BAD_STATE_KHR:
++		return "EGL_BAD_STATE_KHR";
+ 	}
+ 	return "unknown error";
+ }
+ 
+ static void egl_log(EGLenum error, const char *command, EGLint msg_type,
+ 		EGLLabelKHR thread, EGLLabelKHR obj, const char *msg) {
+-	_wlr_log(egl_log_importance_to_wlr(msg_type),
++	_wlr_log(egl_log_importance_to_wlr(msg_type, error),
+ 		"[EGL] command: %s, error: %s (0x%x), message: \"%s\"",
+ 		command, egl_error_str(error), error, msg);
+ }
+@@ -198,8 +218,99 @@ struct wlr_egl *wlr_egl_create(EGLenum platform, void *remote_display) {
+ 		goto error;
+ 	}
+ 
++	EGLint *attribsDisplay = NULL;
++
++	// Is EGLStreams mode all dmabuf-related functiobality must be disabled.
++	// Else native clients may fail to start.
++	bool is_eglstreams = false;
++	if (platform == EGL_PLATFORM_DEVICE_EXT) {
++		is_eglstreams = true;
++		int drm_fd = (int)(long)remote_display;
++		remote_display = NULL;
++		const char *extensions = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
++		if (!check_egl_ext(extensions, "EGL_EXT_device_base") &&
++			(!check_egl_ext(extensions, "EGL_EXT_device_enumeration") ||
++			!check_egl_ext(extensions, "EGL_EXT_device_query"))) {
++			wlr_log(WLR_ERROR, "Failed to query needed EGL extensions"
++					" for EGL_PLATFORM_DEVICE_EXT");
++			goto error;
++		}
++
++
++		load_egl_proc(&egl->procs.eglQueryDeviceStringEXT,
++				"eglQueryDeviceStringEXT");
++		load_egl_proc(&egl->procs.eglQueryDevicesEXT,
++				"eglQueryDevicesEXT");
++		load_egl_proc(&egl->procs.eglGetOutputLayersEXT,
++				"eglGetOutputLayersEXT");
++		load_egl_proc(&egl->procs.eglCreateStreamKHR,
++				"eglCreateStreamKHR");
++		load_egl_proc(&egl->procs.eglDestroyStreamKHR,
++				"eglDestroyStreamKHR");
++		load_egl_proc(&egl->procs.eglStreamConsumerOutputEXT,
++				"eglStreamConsumerOutputEXT");
++		load_egl_proc(&egl->procs.eglCreateStreamProducerSurfaceKHR,
++				"eglCreateStreamProducerSurfaceKHR");
++		load_egl_proc(&egl->procs.eglStreamConsumerAcquireAttribNV,
++				"eglStreamConsumerAcquireAttribNV");
++		load_egl_proc(&egl->procs.eglQueryStreamAttribNV,
++				"eglQueryStreamAttribNV");
++		load_egl_proc(&egl->procs.eglStreamConsumerReleaseKHR,
++				"eglStreamConsumerReleaseKHR");
++		load_egl_proc(&egl->procs.eglQueryStreamKHR,
++				"eglQueryStreamKHR");
++		load_egl_proc(&egl->procs.eglCreateStreamAttribNV,
++				"eglCreateStreamAttribNV");
++		load_egl_proc(&egl->procs.eglStreamConsumerGLTextureExternalKHR,
++				"eglStreamConsumerGLTextureExternalKHR");
++
++		EGLint num_devices;
++		if (!egl->procs.eglQueryDevicesEXT(0, NULL, &num_devices) || num_devices < 1) {
++			wlr_log(WLR_ERROR, "No devices found for EGL_PLATFORM_DEVICE_EXT");
++			goto error;
++		}
++
++		num_devices = num_devices > 255 ? 255 : num_devices;
++
++		EGLDeviceEXT devices[255];
++		if (!egl->procs.eglQueryDevicesEXT(num_devices, devices, &num_devices)) {
++			wlr_log(WLR_ERROR, "Failed get EGLDevice pointers"
++					" for EGL_PLATFORM_DEVICE_EXT");
++			goto error;
++		}
++
++		const char *drmDeviceFile = drmGetDeviceNameFromFd2(drm_fd);
++
++		for (int i = 0; i < num_devices; i++) {
++			EGLDeviceEXT device = devices[i];
++			const char *device_extensions =
++				egl->procs.eglQueryDeviceStringEXT(device, EGL_EXTENSIONS);
++			if (check_egl_ext(device_extensions, "EGL_EXT_device_drm") &&
++					device != EGL_NO_DEVICE_EXT) {
++				const char *currentDeviceFile =
++					egl->procs.eglQueryDeviceStringEXT(device, EGL_DRM_DEVICE_FILE_EXT);
++				if (strcmp(drmDeviceFile, currentDeviceFile) == 0) {
++					remote_display = device;
++					break;
++				}
++			}
++		}
++
++		if (remote_display == NULL) {
++			wlr_log(WLR_ERROR, "Can't get EGLDevice for drm device %s "
++					"to setup EGLStreams mode", drmDeviceFile);
++			goto error;
++		}
++		attribsDisplay = calloc(3, sizeof(EGLint));
++		attribsDisplay[0] = EGL_DRM_MASTER_FD_EXT;
++		attribsDisplay[1] = drm_fd;
++		attribsDisplay[2] = EGL_NONE;
++	}
++
+ 	egl->display = egl->procs.eglGetPlatformDisplayEXT(platform,
+-		remote_display, NULL);
++		remote_display, attribsDisplay);
++	free(attribsDisplay);
++
+ 	if (egl->display == EGL_NO_DISPLAY) {
+ 		wlr_log(WLR_ERROR, "Failed to create EGL display");
+ 		goto error;
+@@ -223,23 +334,27 @@ struct wlr_egl *wlr_egl_create(EGLenum platform, void *remote_display) {
+ 		load_egl_proc(&egl->procs.eglDestroyImageKHR, "eglDestroyImageKHR");
+ 	}
+ 
+-	egl->exts.image_dmabuf_import_ext =
+-		check_egl_ext(display_exts_str, "EGL_EXT_image_dma_buf_import");
+-	if (check_egl_ext(display_exts_str,
+-			"EGL_EXT_image_dma_buf_import_modifiers")) {
+-		egl->exts.image_dmabuf_import_modifiers_ext = true;
+-		load_egl_proc(&egl->procs.eglQueryDmaBufFormatsEXT,
+-			"eglQueryDmaBufFormatsEXT");
+-		load_egl_proc(&egl->procs.eglQueryDmaBufModifiersEXT,
+-			"eglQueryDmaBufModifiersEXT");
+-	}
++	// Disable all dmf-buf functionality for EGLStreams.
++	// TODO: Enable when nvidia driver is ready.
++	if (!is_eglstreams) {
++		egl->exts.image_dmabuf_import_ext = 
++			check_egl_ext(display_exts_str, "EGL_EXT_image_dma_buf_import");
++		if (check_egl_ext(display_exts_str,
++				"EGL_EXT_image_dma_buf_import_modifiers")) {
++			egl->exts.image_dmabuf_import_modifiers_ext = true;
++			load_egl_proc(&egl->procs.eglQueryDmaBufFormatsEXT,
++				"eglQueryDmaBufFormatsEXT");
++			load_egl_proc(&egl->procs.eglQueryDmaBufModifiersEXT,
++				"eglQueryDmaBufModifiersEXT");
++		}
+ 
+-	if (check_egl_ext(display_exts_str, "EGL_MESA_image_dma_buf_export")) {
+-		egl->exts.image_dma_buf_export_mesa = true;
+-		load_egl_proc(&egl->procs.eglExportDMABUFImageQueryMESA,
+-			"eglExportDMABUFImageQueryMESA");
+-		load_egl_proc(&egl->procs.eglExportDMABUFImageMESA,
+-			"eglExportDMABUFImageMESA");
++		if (check_egl_ext(display_exts_str, "EGL_MESA_image_dma_buf_export")) {
++			egl->exts.image_dma_buf_export_mesa = true;
++			load_egl_proc(&egl->procs.eglExportDMABUFImageQueryMESA,
++				"eglExportDMABUFImageQueryMESA");
++			load_egl_proc(&egl->procs.eglExportDMABUFImageMESA,
++				"eglExportDMABUFImageMESA");
++		}
+ 	}
+ 
+ 	if (check_egl_ext(display_exts_str, "EGL_WL_bind_wayland_display")) {
+@@ -252,6 +367,50 @@ struct wlr_egl *wlr_egl_create(EGLenum platform, void *remote_display) {
+ 			"eglQueryWaylandBufferWL");
+ 	}
+ 
++	egl->egl_config = EGL_NO_CONFIG_KHR;
++	if (is_eglstreams) {
++		if (!check_egl_ext(display_exts_str, "EGL_EXT_output_base") ||
++			!check_egl_ext(display_exts_str,
++				"EGL_EXT_output_drm") ||
++			!check_egl_ext(display_exts_str,
++				"EGL_KHR_stream") ||
++			!check_egl_ext(display_exts_str,
++				"EGL_KHR_stream_producer_eglsurface") ||
++			!check_egl_ext(display_exts_str,
++				"EGL_EXT_stream_consumer_egloutput") ||
++			!check_egl_ext(display_exts_str,
++				"EGL_NV_stream_attrib") ||
++			!check_egl_ext(display_exts_str,
++				"EGL_EXT_stream_acquire_mode") ||
++			!check_egl_ext(display_exts_str,
++				"EGL_KHR_stream_consumer_gltexture") ||
++			!check_egl_ext(display_exts_str,
++				"EGL_WL_wayland_eglstream")) {
++			wlr_log(WLR_ERROR, "Some required display extensions for "
++					"EGLStreams are missing");
++			goto error;
++
++		}
++		EGLint config_attribs [] = {
++			EGL_SURFACE_TYPE,         EGL_STREAM_BIT_KHR,
++			EGL_RED_SIZE,             1,
++			EGL_GREEN_SIZE,           1,
++			EGL_BLUE_SIZE,            1,
++			EGL_RENDERABLE_TYPE,      EGL_OPENGL_ES2_BIT,
++			EGL_CONFIG_CAVEAT,        EGL_NONE,
++			EGL_NONE,
++		};
++
++		EGLint egl_num_configs;
++		if (!eglChooseConfig(egl->display, config_attribs,
++			&egl->egl_config, 1, &egl_num_configs) ||
++				egl_num_configs < 1) {
++			wlr_log(WLR_ERROR,
++				"No EGL configs foung for EGLStreams setup");
++			goto error;
++		}
++	}
++
+ 	const char *device_exts_str = NULL;
+ 	if (check_egl_ext(client_exts_str, "EGL_EXT_device_query")) {
+ 		load_egl_proc(&egl->procs.eglQueryDisplayAttribEXT,
+@@ -265,7 +424,16 @@ struct wlr_egl *wlr_egl_create(EGLenum platform, void *remote_display) {
+ 			wlr_log(WLR_ERROR, "eglQueryDisplayAttribEXT(EGL_DEVICE_EXT) failed");
+ 			goto error;
+ 		}
+-		egl->device = (EGLDeviceEXT)device_attrib;
++		EGLDeviceEXT displayDevice = (EGLDeviceEXT)device_attrib;
++
++		if(egl->device && egl->device != displayDevice) {
++			wlr_log(WLR_ERROR,
++				"Queried EGL display device is different "
++				"from one display was created from");
++			goto error;
++		}
++
++		egl->device = displayDevice; 
+ 
+ 		device_exts_str =
+ 			egl->procs.eglQueryDeviceStringEXT(egl->device, EGL_EXTENSIONS);
+@@ -323,7 +491,7 @@ struct wlr_egl *wlr_egl_create(EGLenum platform, void *remote_display) {
+ 
+ 	// On DRM, request a high priority context if possible
+ 	bool request_high_priority = ext_context_priority &&
+-		platform == EGL_PLATFORM_GBM_MESA;
++		(platform == EGL_PLATFORM_GBM_MESA || platform == EGL_PLATFORM_DEVICE_EXT);
+ 
+ 	// Try to reschedule all of our rendering to be completed first. If it
+ 	// fails, it will fallback to the default priority (MEDIUM).
+@@ -335,7 +503,7 @@ struct wlr_egl *wlr_egl_create(EGLenum platform, void *remote_display) {
+ 	attribs[atti++] = EGL_NONE;
+ 	assert(atti <= sizeof(attribs)/sizeof(attribs[0]));
+ 
+-	egl->context = eglCreateContext(egl->display, EGL_NO_CONFIG_KHR,
++	egl->context = eglCreateContext(egl->display, egl->egl_config,
+ 		EGL_NO_CONTEXT, attribs);
+ 	if (egl->context == EGL_NO_CONTEXT) {
+ 		wlr_log(WLR_ERROR, "Failed to create EGL context");
+@@ -413,8 +581,10 @@ bool wlr_egl_destroy_image(struct wlr_egl *egl, EGLImage image) {
+ }
+ 
+ bool wlr_egl_make_current(struct wlr_egl *egl) {
+-	if (!eglMakeCurrent(egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+-			egl->context)) {
++	EGLSurface surface = egl->current_eglstream ?
++		egl->current_eglstream->surface : EGL_NO_SURFACE;
++
++	if (!eglMakeCurrent(egl->display, surface, surface, egl->context)) {
+ 		wlr_log(WLR_ERROR, "eglMakeCurrent failed");
+ 		return false;
+ 	}
+@@ -422,6 +592,7 @@ bool wlr_egl_make_current(struct wlr_egl *egl) {
+ }
+ 
+ bool wlr_egl_unset_current(struct wlr_egl *egl) {
++	egl->current_eglstream = NULL;
+ 	if (!eglMakeCurrent(egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+ 			EGL_NO_CONTEXT)) {
+ 		wlr_log(WLR_ERROR, "eglMakeCurrent failed");
+@@ -807,3 +978,311 @@ int wlr_egl_dup_drm_fd(struct wlr_egl *egl) {
+ 
+ 	return render_fd;
+ }
++
++bool wlr_egl_create_eglstreams_surface(struct wlr_eglstream *egl_stream,
++		uint32_t plane_id, int width, int height) {
++
++	EGLAttrib layer_attribs[] = {
++		EGL_DRM_PLANE_EXT,
++		plane_id,
++		EGL_NONE,
++	};
++
++	EGLint stream_attribs[] = {
++		// Mailbox mode - presenting the most recent frame.
++		EGL_STREAM_FIFO_LENGTH_KHR, 0,
++		EGL_CONSUMER_AUTO_ACQUIRE_EXT, EGL_FALSE,
++		EGL_NONE
++	};
++
++	EGLint surface_attribs[] = {
++		EGL_WIDTH, width,
++		EGL_HEIGHT, height,
++		EGL_NONE
++	};
++
++	EGLOutputLayerEXT egl_layer;
++	EGLint n_layers = 0;
++	struct wlr_egl *egl = egl_stream->egl;
++	if (!egl) {
++		return false;
++	}
++
++	EGLBoolean res = egl->procs.eglGetOutputLayersEXT(egl->display,
++				layer_attribs, &egl_layer, 1, &n_layers);
++	if (!res || !n_layers) {
++		wlr_log(WLR_ERROR, "Error getting egl output layer for plane %d", plane_id);
++		return false;
++	}
++
++	egl_stream->stream = NULL;
++	egl_stream->surface = NULL;
++	egl_stream->busy = false;
++
++	egl_stream->stream = egl->procs.eglCreateStreamKHR(egl->display, stream_attribs);
++    
++	if (egl_stream->stream == EGL_NO_STREAM_KHR) {
++		wlr_log(WLR_ERROR, "Unable to create egl stream");
++		goto error;
++	}
++
++	if (!egl->procs.eglStreamConsumerOutputEXT(egl->display, egl_stream->stream, egl_layer)) {
++		wlr_log(WLR_ERROR, "Unable to create egl stream consumer");
++		goto error;
++	}
++
++	egl_stream->surface = egl->procs.eglCreateStreamProducerSurfaceKHR(egl->display,
++			egl->egl_config, egl_stream->stream, surface_attribs);
++
++	if (!egl_stream->surface) {
++		wlr_log(WLR_ERROR, "Failed to create egl stream producer surface");
++		goto error;
++	}
++
++	wlr_log(WLR_INFO, "EGLStream for plane %u (%dx%d) has been set up", plane_id,
++		width, height);
++
++	return true;
++
++error:
++	if (egl_stream->stream) {
++		egl->procs.eglDestroyStreamKHR(egl->display, egl_stream->stream);
++	}
++	if (egl_stream->surface) {
++		eglDestroySurface(egl->display, egl_stream->surface);
++	}
++
++	return false;
++}
++
++void wlr_egl_destroy_eglstreams_surface(struct wlr_eglstream *egl_stream) {
++	if (egl_stream->surface) {
++		eglDestroySurface(egl_stream->egl->display, egl_stream->surface);
++		egl_stream->surface = NULL;
++	}
++	if (egl_stream->stream) {
++		egl_stream->egl->procs.eglDestroyStreamKHR(egl_stream->egl->display,
++			egl_stream->stream);
++		egl_stream->stream = NULL;
++	}
++}
++
++bool wlr_egl_flip_eglstreams_page(struct wlr_output *output) {
++	assert(wlr_output_is_drm(output));
++	struct wlr_drm_connector *conn = (struct wlr_drm_connector *)output;
++	assert(conn);
++	if (!conn) {
++		return false;
++	}
++	struct wlr_drm_backend *drm = conn->backend;
++
++	struct wlr_drm_crtc *crtc = conn->crtc;
++	assert(crtc);
++	if (!crtc) {
++		return false;
++	}
++	struct wlr_drm_plane *plane = crtc->primary;
++	assert(plane);
++	if (!plane) {
++		return false;
++	}
++	struct wlr_drm_surface *surf = drm->parent ?
++		&plane->mgpu_surf : &plane->surf;
++	struct wlr_swapchain *swapchain = surf->swapchain; 
++	assert(swapchain);
++	if (!swapchain) {
++		return false;
++	}
++	struct wlr_eglstream_plane *egl_stream_plane = 
++		wlr_eglstream_plane_for_id(swapchain->allocator, plane->id);
++	assert(egl_stream_plane);
++	if (!egl_stream_plane) {
++		return false;
++	}
++	struct wlr_eglstream *egl_stream = &egl_stream_plane->stream;
++	struct wlr_egl *egl = egl_stream->egl;
++
++	struct wlr_egl_context old_ctx;
++	wlr_egl_save_context(&old_ctx);
++	eglMakeCurrent(egl->display, egl_stream->surface, egl_stream->surface, egl->context);
++
++	// Update buffer age.
++	// Note: this is needed for wlr damage tracking to work properly.
++	// Swapchain's implementation is skipped for EGLStreams buffers.
++	EGLint buffer_age;
++	if (eglQuerySurface(egl->display, egl_stream->surface,
++		EGL_BUFFER_AGE_KHR, &buffer_age) != EGL_TRUE) {
++		wlr_log(WLR_ERROR, "EGLstream buffer age couldn't be queried!"
++				"Full frame area will be updated!");
++		buffer_age = 0;
++	}
++	// Every buffer is EGLStreams mode is just a wrapper
++	// around the only one real EGLStream. 
++	// Swapchain works inside EGL.
++	for (size_t i = 0; i < WLR_SWAPCHAIN_CAP; i++) {
++		struct wlr_swapchain_slot *slot = &swapchain->slots[i];
++		if (slot->buffer) {
++			slot->age = buffer_age;
++		}
++	}
++
++	// My experiments show that nvidia driver uses some kind of fast path
++	// for damage/buffer age tracking, thus making eglSwapBuffersWithDamage and
++	// eglSetDamageRegion useless.
++	// Tip: Do not swap if stream is marked busy to avoid deadlock.
++	if (!egl_stream->busy && eglSwapBuffers(egl->display, egl_stream->surface) != EGL_TRUE) {
++		wlr_log(WLR_ERROR, "Swap buffers for EGLStream failed");
++	}
++
++
++	EGLAttrib acquire_attribs[] = {
++		EGL_DRM_FLIP_EVENT_DATA_NV, (EGLAttrib)egl_stream->drm,
++		EGL_NONE
++	};
++	EGLBoolean ok = egl->procs.eglStreamConsumerAcquireAttribNV(egl->display,
++			egl_stream->stream, acquire_attribs);
++
++	egl_stream->busy = ok == EGL_FALSE && eglGetError() == EGL_RESOURCE_BUSY_EXT;
++
++	wlr_egl_restore_context(&old_ctx);
++
++	return ok == EGL_TRUE || egl_stream->busy;
++
++}
++
++enum wl_output_transform
++wlr_egl_normalize_output_transform(enum wl_output_transform source_transform) {
++	enum wl_output_transform result_transform = source_transform;
++	switch (source_transform) {
++		case WL_OUTPUT_TRANSFORM_NORMAL:
++			result_transform = WL_OUTPUT_TRANSFORM_FLIPPED_180;
++			break;
++		case WL_OUTPUT_TRANSFORM_90:
++			result_transform = WL_OUTPUT_TRANSFORM_FLIPPED_90;
++			break;
++		case WL_OUTPUT_TRANSFORM_180:
++			result_transform = WL_OUTPUT_TRANSFORM_FLIPPED;
++			break;
++		case WL_OUTPUT_TRANSFORM_270:
++			result_transform = WL_OUTPUT_TRANSFORM_FLIPPED_270;
++			break;
++		case WL_OUTPUT_TRANSFORM_FLIPPED:
++			result_transform = WL_OUTPUT_TRANSFORM_180;
++			break;
++		case WL_OUTPUT_TRANSFORM_FLIPPED_90:
++			result_transform = WL_OUTPUT_TRANSFORM_90;
++			break;
++		case WL_OUTPUT_TRANSFORM_FLIPPED_180:
++			result_transform = WL_OUTPUT_TRANSFORM_NORMAL;
++			break;
++		case WL_OUTPUT_TRANSFORM_FLIPPED_270:
++			result_transform = WL_OUTPUT_TRANSFORM_270;
++			break;
++		default:
++			assert(false);
++			break;
++
++	}
++	return result_transform;
++}
++
++
++static struct wl_interface *eglstream_controller_interface = NULL;
++
++static void
++attach_eglstream_consumer_attribs(struct wl_client *client,
++			  struct wl_resource *resource,
++			  struct wl_resource *wl_surface,
++			  struct wl_resource *wl_eglstream,
++			  struct wl_array *attribs)
++{
++	struct wlr_surface *surface = wlr_surface_from_resource(wl_surface);
++	if (!surface->is_eglstream) {
++		// egl surface should be y flipped opposed to drm surfaces
++		surface->is_eglstream = true;
++		surface->pending.committed |= WLR_SURFACE_STATE_TRANSFORM;
++		surface->pending.transform =
++			wlr_egl_normalize_output_transform(surface->current.transform); 
++	}
++	assert(surface);
++	struct wlr_texture *texture =
++		wlr_texture_from_wl_eglstream(surface->renderer, wl_eglstream);
++	if (texture == NULL) {
++		wlr_log(WLR_ERROR, "Failed to upload eglstream buffer");
++		wl_client_post_no_memory(client);
++		return;
++	}
++	// stream is cached now
++	wlr_texture_destroy(texture);
++}
++
++static void
++attach_eglstream_consumer(struct wl_client *client,
++			  struct wl_resource *resource,
++			  struct wl_resource *wl_surface,
++			  struct wl_resource *wl_eglstream) {
++	attach_eglstream_consumer_attribs(client, resource,
++			wl_surface, wl_eglstream, NULL);
++}
++
++static const struct wl_eglstream_controller_interface
++eglstream_controller_implementation = {
++	attach_eglstream_consumer,
++	attach_eglstream_consumer_attribs,
++};
++
++static void
++bind_eglstream_controller(struct wl_client *client,
++			  void *data, uint32_t version, uint32_t id)
++{
++	struct wl_resource *resource;
++	pid_t pid; uid_t uid; gid_t gid;
++	wl_client_get_credentials(client, &pid, &uid, &gid);
++	resource = wl_resource_create(client, eglstream_controller_interface,
++				      version, id);
++
++	if (resource == NULL) {
++		wl_client_post_no_memory(client);
++		return;
++	}
++	wl_resource_set_implementation(resource,
++				       &eglstream_controller_implementation,
++				       data,
++				       NULL);
++}
++
++void init_eglstream_controller(struct wl_display *display)
++{
++	/*
++	 * wl_eglstream_controller_interface is provided by
++	 * libnvidia-egl-wayland.so.1
++	 *
++	 * Since it might not be available on the
++	 * system, dynamically load it at runtime and resolve the needed
++	 * symbols. If available, it should be found under any of the search
++	 * directories of dlopen()
++	 *
++	 * Failure to initialize wl_eglstream_controller is non-fatal
++	 */
++
++	void *lib = dlopen("libnvidia-egl-wayland.so.1", RTLD_NOW | RTLD_LAZY);
++	if (!lib)
++		goto fail;
++
++	eglstream_controller_interface =
++		dlsym(lib, "wl_eglstream_controller_interface");
++
++	if (!eglstream_controller_interface)
++		goto fail;
++
++	if (wl_global_create(display,
++			     eglstream_controller_interface, 2,
++			     NULL, bind_eglstream_controller))
++		return; /* success */
++fail:
++	if (lib)
++		dlclose(lib);
++	wlr_log(WLR_ERROR,
++			"Unable to initialize wl_eglstream_controller.");
++}
++
+diff --git a/render/eglstreams_allocator.c b/render/eglstreams_allocator.c
+new file mode 100644
+index 000000000..3aa731838
+--- /dev/null
++++ b/render/eglstreams_allocator.c
+@@ -0,0 +1,197 @@
++
++#define _POSIX_C_SOURCE 200809L
++#include <assert.h>
++#include <drm_fourcc.h>
++#include <fcntl.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <wlr/util/log.h>
++#include <xf86drm.h>
++#include <backend/drm/drm.h>
++#include "render/eglstreams_allocator.h"
++#include "render/wlr_renderer.h"
++
++static const struct wlr_buffer_impl buffer_impl;
++
++static struct wlr_eglstream_buffer *get_eglstresms_buffer_from_buffer(
++		struct wlr_buffer *buffer) {
++	assert(buffer->impl == &buffer_impl);
++	return (struct wlr_eglstream_buffer *)buffer;
++}
++
++static struct wlr_eglstream_buffer *create_buffer(struct wlr_eglstreams_allocator *alloc,
++		struct wlr_eglstream_plane *plane) {
++
++	struct wlr_eglstream_buffer *buffer = calloc(1, sizeof(*buffer));
++	if (buffer == NULL) {
++		return NULL;
++	}
++	wlr_buffer_init(&buffer->base, &buffer_impl, plane->width, plane->height);
++
++	buffer->base.egl_stream = &plane->stream;
++	buffer->plane = plane;
++	plane->locks++;
++
++	wlr_log(WLR_DEBUG, "Allocated %dx%d EGLStreams buffer",
++		buffer->base.width, buffer->base.height);
++
++	return buffer;
++}
++
++static void plane_unlock(struct wlr_eglstream_plane *plane) {
++	if (!plane) {
++		return;
++	}
++	if (plane->locks > 0 && --plane->locks > 0) {
++		return;
++	}	
++	wlr_log(WLR_INFO, "Destroying plane %u, %dx%d", plane->id,
++		plane->width, plane->height);
++	wlr_egl_destroy_eglstreams_surface(&plane->stream);
++	wl_list_remove(&plane->link);
++	free(plane);
++}
++
++static void buffer_destroy(struct wlr_buffer *wlr_buffer) {
++	struct wlr_eglstream_buffer *buffer =
++		get_eglstresms_buffer_from_buffer(wlr_buffer);
++	wlr_log(WLR_INFO, "Destroy buffer");
++	plane_unlock(buffer->plane);	
++	free(buffer);
++}
++
++static bool buffer_get_dmabuf(struct wlr_buffer *wlr_buffer,
++		struct wlr_dmabuf_attributes *attribs) {
++	// Disable dma-buf functiobality for EGLStreams.
++	// TODO: Enable when nvidia driver is ready.
++	wlr_log(WLR_ERROR, "Dma-Buf for EGLStreams is not supported");
++	return false;
++}
++
++static const struct wlr_buffer_impl buffer_impl = {
++	.destroy = buffer_destroy,
++	.get_dmabuf = buffer_get_dmabuf,
++};
++
++static const struct wlr_allocator_interface allocator_impl;
++
++static struct wlr_eglstreams_allocator *get_egstreams_alloc_from_alloc(
++		struct wlr_allocator *alloc) {
++	assert(alloc->impl == &allocator_impl);
++	return (struct wlr_eglstreams_allocator *)alloc;
++}
++
++struct wlr_gbm_allocator *
++	wlr_eglstreams_allocator_create(struct wlr_drm_backend *drm) {
++	struct wlr_eglstreams_allocator *alloc = calloc(1, sizeof(*alloc));
++	if (alloc == NULL) {
++		return NULL;
++	}
++	wlr_allocator_init(&alloc->base_gbm.base, &allocator_impl);
++
++	alloc->drm = drm;
++	wl_list_init(&alloc->planes);
++	wlr_log(WLR_DEBUG, "Created EGLStreams allocator"); 
++
++	return &alloc->base_gbm;
++}
++
++static void allocator_destroy(struct wlr_allocator *wlr_alloc) {
++	struct wlr_eglstreams_allocator *alloc =
++		get_egstreams_alloc_from_alloc(wlr_alloc);
++
++	free(alloc);
++}
++
++struct wlr_eglstream_plane *wlr_eglstream_plane_for_id(
++		struct wlr_allocator *wlr_alloc, uint32_t plane_id) {
++	struct wlr_eglstreams_allocator *alloc = get_egstreams_alloc_from_alloc(wlr_alloc);
++	struct wlr_eglstream_plane *plane;
++	bool found = false;
++	wl_list_for_each(plane, &alloc->planes, link) {
++		if (plane->id == plane_id) {
++			found = true;
++			break;
++		}
++	}
++	return found ? plane : NULL;
++}
++
++static struct wlr_eglstream_plane *find_or_create_plane(
++		struct wlr_eglstreams_allocator *alloc,
++		int width, int height, uint32_t plane_id) {
++
++	struct wlr_eglstream_plane *plane =
++		wlr_eglstream_plane_for_id(&alloc->base_gbm.base, plane_id);
++
++	struct wlr_renderer *renderer = alloc->drm->renderer.wlr_rend;
++
++	struct wlr_egl *egl = wlr_renderer_get_egl(renderer);
++	if (!egl) {
++		return NULL;
++	}
++
++	if (plane) {
++		if (width != plane->width || height != plane->height) {
++			wlr_log(WLR_ERROR, "Found EGLStream plane size differs. "
++				"%dx%d -> %dx%d (new)"
++				"New plane will be created",
++				plane->width, plane->height, width, height);
++			plane = NULL;
++		} else {
++			wlr_log(WLR_INFO, "Found allocated plane %u, %dx%d", plane_id,
++				plane->width, plane->height);
++		}
++	} else {
++		plane = NULL;
++	}
++
++	if (plane == NULL) {
++		plane = calloc(1, sizeof(*plane));
++		if (!plane) {
++			wlr_log(WLR_ERROR, "EGLStream plane allocation failed");
++			return NULL;
++		}
++		plane->id = plane_id;
++		plane->stream.drm = alloc->drm;
++		plane->stream.egl = egl;
++		plane->width = width;
++		plane->height = height;
++		if (!wlr_egl_create_eglstreams_surface(&plane->stream, 
++				plane_id, width, height)) {
++			wlr_log(WLR_ERROR, "EGLStream setup failed for plane %u", plane_id);
++			goto error;
++		}
++		wl_list_insert(&alloc->planes, &plane->link);
++	}
++
++	return plane;
++error:
++	free(plane);
++	return NULL;
++
++}
++
++static struct wlr_buffer *allocator_create_buffer(
++		struct wlr_allocator *wlr_alloc, int width, int height,
++		const struct wlr_drm_format *format, void *data) {
++	struct wlr_eglstreams_allocator *alloc =
++		get_egstreams_alloc_from_alloc(wlr_alloc);
++	// Note: every EGLStream buffer is just a pointer
++	// to the only one real EGLStream for drm plane.
++	struct wlr_eglstream_plane *plane =
++		find_or_create_plane(alloc, width, height, (uint32_t)(long)data);
++	if (!plane) {
++		return NULL;
++	}
++	struct wlr_eglstream_buffer *buffer = create_buffer(alloc, plane);
++	if (buffer == NULL) {
++		return NULL;
++	}
++	return &buffer->base;
++}
++
++static const struct wlr_allocator_interface allocator_impl = {
++	.destroy = allocator_destroy,
++	.create_buffer = allocator_create_buffer,
++};
+diff --git a/render/gbm_allocator.c b/render/gbm_allocator.c
+index e01be0915..b3e19eeba 100644
+--- a/render/gbm_allocator.c
++++ b/render/gbm_allocator.c
+@@ -201,7 +201,8 @@ static void allocator_destroy(struct wlr_allocator *wlr_alloc) {
+ 
+ static struct wlr_buffer *allocator_create_buffer(
+ 		struct wlr_allocator *wlr_alloc, int width, int height,
+-		const struct wlr_drm_format *format) {
++		const struct wlr_drm_format *format, void *data) {
++	(void)data; // Unused here
+ 	struct wlr_gbm_allocator *alloc = get_gbm_alloc_from_alloc(wlr_alloc);
+ 	struct wlr_gbm_buffer *buffer = create_buffer(alloc, width, height, format);
+ 	if (buffer == NULL) {
+diff --git a/render/gles2/renderer.c b/render/gles2/renderer.c
+index 504af5749..44b6f8d2d 100644
+--- a/render/gles2/renderer.c
++++ b/render/gles2/renderer.c
+@@ -42,21 +42,23 @@ static struct wlr_gles2_renderer *gles2_get_renderer_in_context(
+ static void destroy_buffer(struct wlr_gles2_buffer *buffer) {
+ 	wl_list_remove(&buffer->link);
+ 	wl_list_remove(&buffer->buffer_destroy.link);
++	// EGLStreams buffers do not use FBOs
++	if (!buffer->buffer->egl_stream) {
++		struct wlr_egl_context prev_ctx;
++		wlr_egl_save_context(&prev_ctx);
++		wlr_egl_make_current(buffer->renderer->egl);
+ 
+-	struct wlr_egl_context prev_ctx;
+-	wlr_egl_save_context(&prev_ctx);
+-	wlr_egl_make_current(buffer->renderer->egl);
++		push_gles2_debug(buffer->renderer);
+ 
+-	push_gles2_debug(buffer->renderer);
++		glDeleteFramebuffers(1, &buffer->fbo);
++		glDeleteRenderbuffers(1, &buffer->rbo);
+ 
+-	glDeleteFramebuffers(1, &buffer->fbo);
+-	glDeleteRenderbuffers(1, &buffer->rbo);
++		pop_gles2_debug(buffer->renderer);
+ 
+-	pop_gles2_debug(buffer->renderer);
+-
+-	wlr_egl_destroy_image(buffer->renderer->egl, buffer->image);
+-
+-	wlr_egl_restore_context(&prev_ctx);
++		wlr_egl_destroy_image(buffer->renderer->egl, buffer->image);
++	
++		wlr_egl_restore_context(&prev_ctx);
++	}
+ 
+ 	free(buffer);
+ }
+@@ -87,39 +89,48 @@ static struct wlr_gles2_buffer *create_buffer(struct wlr_gles2_renderer *rendere
+ 	}
+ 	buffer->buffer = wlr_buffer;
+ 	buffer->renderer = renderer;
++	if (buffer->buffer->egl_stream) {
++		// We're rendering to a EGL surface,
++		// No need for special wrapping magic here.
++		assert(buffer->buffer->egl_stream->surface);
++		buffer->fbo = 0;
++		buffer->rbo = 0;
++	} else {
++		struct wlr_dmabuf_attributes dmabuf = {0};
++		if (!wlr_buffer_get_dmabuf(wlr_buffer, &dmabuf)) {
++			goto error_buffer;
++		}
+ 
+-	struct wlr_dmabuf_attributes dmabuf = {0};
+-	if (!wlr_buffer_get_dmabuf(wlr_buffer, &dmabuf)) {
+-		goto error_buffer;
+-	}
+-
+-	bool external_only;
+-	buffer->image = wlr_egl_create_image_from_dmabuf(renderer->egl,
+-		&dmabuf, &external_only);
+-	if (buffer->image == EGL_NO_IMAGE_KHR) {
+-		goto error_buffer;
+-	}
+-
+-	push_gles2_debug(renderer);
++		bool external_only;
++		buffer->image = wlr_egl_create_image_from_dmabuf(renderer->egl,
++			&dmabuf, &external_only);
++		if (buffer->image == EGL_NO_IMAGE_KHR) {
++			goto error_buffer;
++		}
+ 
+-	glGenRenderbuffers(1, &buffer->rbo);
+-	glBindRenderbuffer(GL_RENDERBUFFER, buffer->rbo);
+-	renderer->procs.glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER,
+-		buffer->image);
+-	glBindRenderbuffer(GL_RENDERBUFFER, 0);
++		push_gles2_debug(renderer);
+ 
+-	glGenFramebuffers(1, &buffer->fbo);
+-	glBindFramebuffer(GL_FRAMEBUFFER, buffer->fbo);
+-	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+-		GL_RENDERBUFFER, buffer->rbo);
+-	GLenum fb_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
++		glGenRenderbuffers(1, &buffer->rbo);
++		glBindRenderbuffer(GL_RENDERBUFFER, buffer->rbo);
++		renderer->procs.glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER,
++			buffer->image);
++		glBindRenderbuffer(GL_RENDERBUFFER, 0);
++
++		glGenFramebuffers(1, &buffer->fbo);
++		glBindFramebuffer(GL_FRAMEBUFFER, buffer->fbo);
++		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++			GL_RENDERBUFFER, buffer->rbo);
++		GLenum fb_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+ 
+-	pop_gles2_debug(renderer);
++		pop_gles2_debug(renderer);
+ 
+-	if (fb_status != GL_FRAMEBUFFER_COMPLETE) {
+-		wlr_log(WLR_ERROR, "Failed to create FBO");
+-		goto error_image;
++		if (fb_status != GL_FRAMEBUFFER_COMPLETE) {
++			wlr_log(WLR_ERROR, "Failed to create FBO");
++			goto error_image;
++		}
++		wlr_log(WLR_DEBUG, "Created GL FBO for buffer %dx%d",
++			wlr_buffer->width, wlr_buffer->height);
+ 	}
+ 
+ 	buffer->buffer_destroy.notify = handle_buffer_destroy;
+@@ -127,9 +138,6 @@ static struct wlr_gles2_buffer *create_buffer(struct wlr_gles2_renderer *rendere
+ 
+ 	wl_list_insert(&renderer->buffers, &buffer->link);
+ 
+-	wlr_log(WLR_DEBUG, "Created GL FBO for buffer %dx%d",
+-		wlr_buffer->width, wlr_buffer->height);
+-
+ 	return buffer;
+ 
+ error_image:
+@@ -160,6 +168,9 @@ static bool gles2_bind_buffer(struct wlr_renderer *wlr_renderer,
+ 		return true;
+ 	}
+ 
++	// Used for setting up current EGL context for a frame.
++	renderer->egl->current_eglstream = wlr_buffer->egl_stream;
++
+ 	wlr_egl_make_current(renderer->egl);
+ 
+ 	struct wlr_gles2_buffer *buffer = get_buffer(renderer, wlr_buffer);
+@@ -252,7 +263,6 @@ static bool gles2_render_subtexture_with_matrix(
+ 		gles2_get_texture(wlr_texture);
+ 
+ 	struct wlr_gles2_tex_shader *shader = NULL;
+-
+ 	switch (texture->target) {
+ 	case GL_TEXTURE_2D:
+ 		if (texture->has_alpha) {
+@@ -533,6 +543,15 @@ static bool gles2_blit_dmabuf(struct wlr_renderer *wlr_renderer,
+ 		return false;
+ 	}
+ 
++	if(!renderer->egl->gbm_device) {
++		// gdm_device is null for EGLStreams mode.
++		// TODO: Blitting for EGLStreams if required.
++		// TODO(danvd): Test with 2 GPU combinations (I've got some).
++		// Note: This will be greatly simplified when nvidia 
++		// dms-buf support is ready.
++		return false;
++	}
++
+ 	struct wlr_egl_context old_context;
+ 	wlr_egl_save_context(&old_context);
+ 
+@@ -642,7 +661,7 @@ static int gles2_get_drm_fd(struct wlr_renderer *wlr_renderer) {
+ 	return renderer->drm_fd;
+ }
+ 
+-struct wlr_egl *wlr_gles2_renderer_get_egl(struct wlr_renderer *wlr_renderer) {
++struct wlr_egl *gles2_renderer_get_egl(struct wlr_renderer *wlr_renderer) {
+ 	struct wlr_gles2_renderer *renderer =
+ 		gles2_get_renderer(wlr_renderer);
+ 	return renderer->egl;
+@@ -704,6 +723,8 @@ static const struct wlr_renderer_impl renderer_impl = {
+ 	.init_wl_display = gles2_init_wl_display,
+ 	.blit_dmabuf = gles2_blit_dmabuf,
+ 	.get_drm_fd = gles2_get_drm_fd,
++	.texture_from_wl_eglstream = gles2_texture_from_wl_eglstream,
++	.get_egl = gles2_renderer_get_egl
+ };
+ 
+ void push_gles2_debug_(struct wlr_gles2_renderer *renderer,
+@@ -857,6 +878,7 @@ struct wlr_renderer *wlr_gles2_renderer_create(struct wlr_egl *egl) {
+ 	wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl);
+ 
+ 	wl_list_init(&renderer->buffers);
++	wl_list_init(&renderer->client_streams);
+ 
+ 	renderer->egl = egl;
+ 	renderer->exts_str = exts_str;
+diff --git a/render/gles2/texture.c b/render/gles2/texture.c
+index a3400eb2c..8a7729b14 100644
+--- a/render/gles2/texture.c
++++ b/render/gles2/texture.c
+@@ -133,9 +133,13 @@ static void gles2_texture_destroy(struct wlr_texture *wlr_texture) {
+ 	wlr_egl_make_current(texture->renderer->egl);
+ 
+ 	push_gles2_debug(texture->renderer);
++	if (!texture->stream) {
++		glDeleteTextures(1, &texture->tex);
++	}
+ 
+-	glDeleteTextures(1, &texture->tex);
+-	wlr_egl_destroy_image(texture->renderer->egl, texture->image);
++	if (texture->image) {
++		wlr_egl_destroy_image(texture->renderer->egl, texture->image);
++	}
+ 
+ 	pop_gles2_debug(texture->renderer);
+ 
+@@ -238,6 +242,7 @@ struct wlr_texture *gles2_texture_from_wl_drm(struct wlr_renderer *wlr_renderer,
+ 	texture->drm_format = DRM_FORMAT_INVALID; // texture can't be written anyways
+ 	texture->image = image;
+ 	texture->inverted_y = inverted_y;
++	texture->stream = EGL_NO_STREAM_KHR;
+ 
+ 	switch (fmt) {
+ 	case EGL_TEXTURE_RGB:
+@@ -323,6 +328,8 @@ struct wlr_texture *gles2_texture_from_dmabuf(struct wlr_renderer *wlr_renderer,
+ 
+ 	texture->target = external_only ? GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D;
+ 
++	texture->stream = EGL_NO_STREAM_KHR;
++
+ 	push_gles2_debug(renderer);
+ 
+ 	glGenTextures(1, &texture->tex);
+@@ -339,6 +346,154 @@ struct wlr_texture *gles2_texture_from_dmabuf(struct wlr_renderer *wlr_renderer,
+ 	return &texture->wlr_texture;
+ }
+ 
++static void gles2_client_egl_stream_destroy(struct wl_listener *listener, void *data) {
++	struct wlr_egl_client_stream *client_stream =
++		wl_container_of(listener, client_stream, destroy_listener);
++	struct wlr_egl_context prev_ctx;
++	struct wlr_egl *egl = client_stream->renderer->egl;
++	wlr_egl_save_context(&prev_ctx);
++	wlr_egl_make_current(client_stream->renderer->egl);
++	egl->procs.eglDestroyStreamKHR(egl->display, client_stream->stream);
++	glDeleteTextures(1, &client_stream->tex);
++	wlr_egl_restore_context(&prev_ctx);
++	wl_list_remove(&client_stream->destroy_listener.link);
++	wl_list_remove(&client_stream->link);
++	free(client_stream);
++}
++
++struct wlr_texture *gles2_texture_from_wl_eglstream(struct wlr_renderer *wlr_renderer,
++		struct wl_resource *resource) {
++	struct wlr_egl_context prev_ctx;
++	struct wlr_gles2_renderer *renderer = gles2_get_renderer(wlr_renderer);
++	struct wlr_egl *egl = renderer->egl;
++	wlr_egl_save_context(&prev_ctx);
++	wlr_egl_make_current(renderer->egl);
++	EGLAttrib stream_attribs[] = {
++		EGL_WAYLAND_EGLSTREAM_WL, (EGLAttrib)resource,
++		EGL_NONE
++	};
++
++	EGLStreamKHR stream = EGL_NO_STREAM_KHR;
++
++	struct wlr_egl_client_stream *attached_stream = NULL;
++	struct wlr_egl_client_stream *tmp;
++	wl_list_for_each(tmp, &renderer->client_streams, link) {
++		if (tmp->resource == resource) {
++			attached_stream = tmp;
++			break;
++		}
++	}
++
++	if (attached_stream) {
++		stream = attached_stream->stream;
++	} else {
++		stream = egl->procs.eglCreateStreamAttribNV(
++				egl->display, stream_attribs);
++	}
++
++	if (stream == EGL_NO_STREAM_KHR) {
++		goto error_ctx;
++	}
++
++	int width, height;
++	EGLint inverted_y;
++	if (!wlr_renderer_wl_buffer_get_params(wlr_renderer, resource, 
++				&width, &height, &inverted_y)) {
++		goto error_stream;
++	}
++
++	struct wlr_gles2_texture *texture =
++		calloc(1, sizeof(struct wlr_gles2_texture));
++	if (texture == NULL) {
++		wlr_log(WLR_ERROR, "Texture allocation failed");
++		goto error_stream;
++	}
++	wlr_texture_init(&texture->wlr_texture, &texture_impl, width, height);
++	texture->renderer = renderer;
++
++	texture->drm_format = DRM_FORMAT_INVALID;
++	texture->image = NULL;
++	texture->stream = stream;
++	texture->inverted_y = inverted_y;
++	texture->has_alpha = true;
++	texture->target = GL_TEXTURE_EXTERNAL_OES;
++
++	push_gles2_debug(renderer);
++
++	bool ok = false;
++	if (attached_stream) {
++		texture->tex = attached_stream->tex;
++		ok = true;
++		if (attached_stream->acquired) {
++			egl->procs.eglStreamConsumerReleaseKHR(
++				egl->display, attached_stream->stream);
++		}
++	} else {
++		glGenTextures(1, &texture->tex);
++		glBindTexture(texture->target, texture->tex);
++		glTexParameteri(texture->target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++		glTexParameteri(texture->target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++	
++		if(egl->procs.eglStreamConsumerGLTextureExternalKHR(
++				egl->display, stream) == EGL_TRUE) {
++			attached_stream = calloc(1, sizeof(*attached_stream));
++			if (attached_stream) {
++				attached_stream->renderer = renderer;
++				attached_stream->stream = stream;
++				attached_stream->acquired = false;
++				attached_stream->resource = resource;
++				attached_stream->tex = texture->tex;
++				attached_stream->destroy_listener.notify =
++					gles2_client_egl_stream_destroy;
++				wl_resource_add_destroy_listener(resource,
++						&attached_stream->destroy_listener);
++				wl_list_insert(&renderer->client_streams,
++						&attached_stream->link);
++				ok = true;
++			}
++		}
++		glBindTexture(texture->target, 0);
++
++		if (!ok) {
++			goto error_texture;
++		}
++	}
++
++	if (ok) {
++		EGLAttrib stream_state;
++		// Fetch new frame if available
++		if (egl->procs.eglQueryStreamAttribNV(egl->display,
++				stream, EGL_STREAM_STATE_KHR,
++				&stream_state) == EGL_TRUE &&
++			stream_state == EGL_STREAM_STATE_NEW_FRAME_AVAILABLE_KHR) {
++				attached_stream->acquired =
++					egl->procs.eglStreamConsumerAcquireAttribNV(egl->display,
++					stream, NULL) == EGL_TRUE;
++		}
++	}
++
++
++	pop_gles2_debug(renderer);
++	wlr_egl_restore_context(&prev_ctx);
++
++	if (!ok) {
++		wlr_log(WLR_ERROR, "Could not bind EGLStream to GL texture");
++		goto error_texture;
++	}
++
++	return &texture->wlr_texture;
++
++error_texture:
++	glDeleteTextures(1, &texture->tex);
++	free(texture);
++error_stream:
++	egl->procs.eglDestroyStreamKHR(
++		egl->display, stream);
++error_ctx:
++	wlr_egl_restore_context(&prev_ctx);
++	return NULL;
++}
++
+ void wlr_gles2_texture_get_attribs(struct wlr_texture *wlr_texture,
+ 		struct wlr_gles2_texture_attribs *attribs) {
+ 	struct wlr_gles2_texture *texture = gles2_get_texture(wlr_texture);
+diff --git a/render/meson.build b/render/meson.build
+index 644c2e21a..39f70f7af 100644
+--- a/render/meson.build
++++ b/render/meson.build
+@@ -8,6 +8,7 @@ wlr_files += files(
+ 	'swapchain.c',
+ 	'wlr_renderer.c',
+ 	'wlr_texture.c',
++	'eglstreams_allocator.c',
+ )
+ 
+ subdir('gles2')
+diff --git a/render/swapchain.c b/render/swapchain.c
+index fd9f87253..2a9ecefe4 100644
+--- a/render/swapchain.c
++++ b/render/swapchain.c
+@@ -15,7 +15,7 @@ static void swapchain_handle_allocator_destroy(struct wl_listener *listener,
+ 
+ struct wlr_swapchain *wlr_swapchain_create(
+ 		struct wlr_allocator *alloc, int width, int height,
+-		const struct wlr_drm_format *format) {
++		const struct wlr_drm_format *format, void *backend_data) {
+ 	struct wlr_swapchain *swapchain = calloc(1, sizeof(*swapchain));
+ 	if (swapchain == NULL) {
+ 		return NULL;
+@@ -23,6 +23,7 @@ struct wlr_swapchain *wlr_swapchain_create(
+ 	swapchain->allocator = alloc;
+ 	swapchain->width = width;
+ 	swapchain->height = height;
++	swapchain->backend_data = backend_data;
+ 
+ 	swapchain->format = wlr_drm_format_dup(format);
+ 	if (swapchain->format == NULL) {
+@@ -104,7 +105,8 @@ struct wlr_buffer *wlr_swapchain_acquire(struct wlr_swapchain *swapchain,
+ 
+ 	wlr_log(WLR_DEBUG, "Allocating new swapchain buffer");
+ 	free_slot->buffer = wlr_allocator_create_buffer(swapchain->allocator,
+-		swapchain->width, swapchain->height, swapchain->format);
++		swapchain->width, swapchain->height, swapchain->format,
++		swapchain->backend_data);
+ 	if (free_slot->buffer == NULL) {
+ 		wlr_log(WLR_ERROR, "Failed to allocate buffer");
+ 		return NULL;
+@@ -127,6 +129,12 @@ void wlr_swapchain_set_buffer_submitted(struct wlr_swapchain *swapchain,
+ 		struct wlr_buffer *buffer) {
+ 	assert(buffer != NULL);
+ 
++	if (buffer->egl_stream) {
++		// Let EGL implementation manage buffer age.
++		// See wlr_egl_flip_eglstreams_page for details.
++		return;
++	}
++
+ 	if (!swapchain_has_buffer(swapchain, buffer)) {
+ 		return;
+ 	}
+diff --git a/render/wlr_renderer.c b/render/wlr_renderer.c
+index 7e62cad1a..8062f8976 100644
+--- a/render/wlr_renderer.c
++++ b/render/wlr_renderer.c
+@@ -12,6 +12,7 @@
+ #include "render/shm_format.h"
+ #include "render/wlr_renderer.h"
+ #include "backend/backend.h"
++#include "backend/drm/drm.h"
+ 
+ void wlr_renderer_init(struct wlr_renderer *renderer,
+ 		const struct wlr_renderer_impl *impl) {
+@@ -252,21 +253,33 @@ bool wlr_renderer_init_wl_display(struct wlr_renderer *r,
+ }
+ 
+ struct wlr_renderer *wlr_renderer_autocreate_with_drm_fd(int drm_fd) {
+-	struct gbm_device *gbm_device = gbm_create_device(drm_fd);
+-	if (!gbm_device) {
+-		wlr_log(WLR_ERROR, "Failed to create GBM device");
+-		return NULL;
+-	}
+-
+-	struct wlr_egl *egl = wlr_egl_create(EGL_PLATFORM_GBM_KHR, gbm_device);
+-	if (egl == NULL) {
+-		wlr_log(WLR_ERROR, "Could not initialize EGL");
+-		gbm_device_destroy(gbm_device);
+-		return NULL;
++	bool is_eglstreams = drm_is_eglstreams(drm_fd);
++	struct wlr_egl *egl = NULL; 
++	if (is_eglstreams)
++	{
++		egl = wlr_egl_create(EGL_PLATFORM_DEVICE_EXT, (void *)(long)drm_fd);
++		egl->gbm_device = NULL;
++		if (egl == NULL) {
++			wlr_log(WLR_ERROR, "Can't initialize EGL for EGL_PLATFORM_DEVICE_EXT");
++			return NULL;
++		}
++	} else {
++		struct gbm_device *gbm_device = gbm_create_device(drm_fd);
++		if (!gbm_device) {
++			wlr_log(WLR_ERROR, "Failed to create GBM device");
++			return NULL;
++		}
++	
++		egl = wlr_egl_create(EGL_PLATFORM_GBM_KHR, gbm_device);
++		if (egl == NULL) {
++			wlr_log(WLR_ERROR, "Could not initialize EGL");
++			gbm_device_destroy(gbm_device);
++			return NULL;
++		}
++	
++		egl->gbm_device = gbm_device;
+ 	}
+ 
+-	egl->gbm_device = gbm_device;
+-
+ 	struct wlr_renderer *renderer = wlr_gles2_renderer_create(egl);
+ 	if (!renderer) {
+ 		wlr_log(WLR_ERROR, "Failed to create GLES2 renderer");
+@@ -292,3 +305,39 @@ int wlr_renderer_get_drm_fd(struct wlr_renderer *r) {
+ 	}
+ 	return r->impl->get_drm_fd(r);
+ }
++
++struct wlr_egl *wlr_renderer_get_egl(struct wlr_renderer *r) {
++	if (!r->impl->get_egl) {
++		return NULL;
++	}
++	return r->impl->get_egl(r);
++} 
++
++bool wlr_renderer_wl_buffer_get_params(struct wlr_renderer *r,
++	struct wl_resource *buffer, int *width, int *height, int *inverted_y) {
++	assert(wlr_resource_is_buffer(buffer));
++
++	struct wlr_egl *egl = wlr_renderer_get_egl(r);
++	if (!egl) {
++		return false;
++	}
++
++	if (width && egl->procs.eglQueryWaylandBufferWL(egl->display,
++			buffer, EGL_WIDTH, width) != EGL_TRUE) {
++		wlr_log(WLR_ERROR, "Failed to get resource width");
++		return false;
++	}
++	if (height && egl->procs.eglQueryWaylandBufferWL(egl->display,
++			buffer, EGL_HEIGHT, height) != EGL_TRUE) {
++		wlr_log(WLR_ERROR, "Failed to get resource height");
++		return false;
++	}
++	if (inverted_y && egl->procs.eglQueryWaylandBufferWL(egl->display,
++			buffer, EGL_WAYLAND_Y_INVERTED_WL,
++			inverted_y) != EGL_TRUE) {
++		wlr_log(WLR_ERROR, "Failed to get resource inverted_y");
++		return false;
++	}
++
++	return width || height || inverted_y;
++}
+diff --git a/render/wlr_texture.c b/render/wlr_texture.c
+index e9a3e3b48..482188655 100644
+--- a/render/wlr_texture.c
++++ b/render/wlr_texture.c
+@@ -42,6 +42,14 @@ struct wlr_texture *wlr_texture_from_dmabuf(struct wlr_renderer *renderer,
+ 	return renderer->impl->texture_from_dmabuf(renderer, attribs);
+ }
+ 
++struct wlr_texture *wlr_texture_from_wl_eglstream(struct wlr_renderer *renderer,
++	struct wl_resource *data) {
++	if (!renderer->impl->texture_from_wl_eglstream) {
++		return NULL;
++	}
++	return renderer->impl->texture_from_wl_eglstream(renderer, data);
++}
++
+ void wlr_texture_get_size(struct wlr_texture *texture, int *width,
+ 		int *height) {
+ 	*width = texture->width;
+diff --git a/types/wlr_buffer.c b/types/wlr_buffer.c
+index b631fa99c..131a4fa9d 100644
+--- a/types/wlr_buffer.c
++++ b/types/wlr_buffer.c
+@@ -13,6 +13,7 @@ void wlr_buffer_init(struct wlr_buffer *buffer,
+ 	buffer->impl = impl;
+ 	buffer->width = width;
+ 	buffer->height = height;
++	buffer->egl_stream = NULL;
+ 	wl_signal_init(&buffer->events.destroy);
+ 	wl_signal_init(&buffer->events.release);
+ }
+@@ -87,6 +88,9 @@ bool wlr_resource_get_buffer_size(struct wl_resource *resource,
+ 			wlr_dmabuf_v1_buffer_from_buffer_resource(resource);
+ 		*width = dmabuf->attributes.width;
+ 		*height = dmabuf->attributes.height;
++	} else if (wlr_renderer_wl_buffer_get_params(renderer,
++			resource, width, height, NULL)) {
++		(void)0;
+ 	} else {
+ 		*width = *height = 0;
+ 		return false;
+@@ -209,6 +213,8 @@ struct wlr_client_buffer *wlr_client_buffer_import(
+ 		// We have imported the DMA-BUF, but we need to prevent the client from
+ 		// re-using the same DMA-BUF for the next frames, so we don't release
+ 		// the buffer yet.
++	} else if ((texture = wlr_texture_from_wl_eglstream(renderer, resource))) {
++		(void)0; // Nothing special is needed for EGLStream texture here
+ 	} else {
+ 		wlr_log(WLR_ERROR, "Cannot upload texture: unknown buffer type");
+ 
+diff --git a/types/wlr_output.c b/types/wlr_output.c
+index d07bc4056..c747c35b6 100644
+--- a/types/wlr_output.c
++++ b/types/wlr_output.c
+@@ -18,6 +18,7 @@
+ #include <wlr/util/region.h>
+ #include "util/global.h"
+ #include "util/signal.h"
++#include "backend/drm/drm.h"
+ 
+ #define OUTPUT_VERSION 3
+ 
+@@ -238,6 +239,13 @@ void wlr_output_update_custom_mode(struct wlr_output *output, int32_t width,
+ 
+ void wlr_output_set_transform(struct wlr_output *output,
+ 		enum wl_output_transform transform) {
++	if (wlr_output_is_drm(output)) {
++		struct wlr_drm_connector *conn = (struct wlr_drm_connector *)output;
++		if (conn->backend->is_eglstreams) {
++			// FIXME: There must be a better way to do this, I hope...
++			transform = wlr_egl_normalize_output_transform(transform);
++		}
++	}
+ 	if (output->transform == transform) {
+ 		output->pending.committed &= ~WLR_OUTPUT_STATE_TRANSFORM;
+ 		return;
+diff --git a/types/wlr_surface.c b/types/wlr_surface.c
+index 7d567c9cd..3dc46bc53 100644
+--- a/types/wlr_surface.c
++++ b/types/wlr_surface.c
+@@ -374,6 +374,13 @@ static void surface_apply_damage(struct wlr_surface *surface) {
+ 		wlr_buffer_unlock(&surface->buffer->base);
+ 	}
+ 	surface->buffer = buffer;
++	if (surface->is_eglstream) {
++		// Let eglstream to do damage tracking
++		pixman_region32_union_rect(
++			&surface->buffer_damage, &surface->buffer_damage, 0, 0,
++			buffer->texture->width, buffer->texture->height);
++
++	}
+ }
+ 
+ static void surface_update_opaque_region(struct wlr_surface *surface) {
+@@ -528,6 +535,9 @@ static void surface_set_buffer_transform(struct wl_client *client,
+ 		return;
+ 	}
+ 	struct wlr_surface *surface = wlr_surface_from_resource(resource);
++	if (surface->is_eglstream) {
++		transform = wlr_egl_normalize_output_transform(transform);
++	}
+ 	surface->pending.committed |= WLR_SURFACE_STATE_TRANSFORM;
+ 	surface->pending.transform = transform;
+ }
+@@ -685,8 +695,6 @@ struct wlr_surface *wlr_surface_create(struct wl_client *client,
+ 	wl_resource_set_implementation(surface->resource, &surface_interface,
+ 		surface, surface_handle_resource_destroy);
+ 
+-	wlr_log(WLR_DEBUG, "New wlr_surface %p (res %p)", surface, surface->resource);
+-
+ 	surface->renderer = renderer;
+ 
+ 	surface_state_init(&surface->current);
+@@ -713,6 +721,8 @@ struct wlr_surface *wlr_surface_create(struct wl_client *client,
+ 		wl_list_init(resource_link);
+ 	}
+ 
++	surface->is_eglstream = false;
++
+ 	return surface;
+ }
+ 
+diff --git a/types/wlr_xdg_decoration_v1.c b/types/wlr_xdg_decoration_v1.c
+index 544035b7b..03d98f2b1 100644
+--- a/types/wlr_xdg_decoration_v1.c
++++ b/types/wlr_xdg_decoration_v1.c
+@@ -179,12 +179,14 @@ static void decoration_manager_handle_get_toplevel_decoration(
+ 		wlr_xdg_surface_from_toplevel_resource(toplevel_resource);
+ 	assert(surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL);
+ 
++#ifndef WLR_RELAXED_CLIENT_HANDLING
+ 	if (wlr_surface_has_buffer(surface->surface)) {
+ 		wl_resource_post_error(manager_resource,
+ 			ZXDG_TOPLEVEL_DECORATION_V1_ERROR_UNCONFIGURED_BUFFER,
+ 			"xdg_toplevel_decoration must not have a buffer at creation");
+ 		return;
+ 	}
++#endif
+ 
+ 	struct wlr_xdg_toplevel_decoration_v1 *decoration =
+ 		calloc(1, sizeof(struct wlr_xdg_toplevel_decoration_v1));
+diff --git a/types/xdg_shell/wlr_xdg_surface.c b/types/xdg_shell/wlr_xdg_surface.c
+index edf562abc..6007a9f9e 100644
+--- a/types/xdg_shell/wlr_xdg_surface.c
++++ b/types/xdg_shell/wlr_xdg_surface.c
+@@ -329,12 +329,14 @@ static void xdg_surface_handle_surface_commit(struct wl_listener *listener,
+ 	struct wlr_xdg_surface *surface =
+ 		wl_container_of(listener, surface, surface_commit);
+ 
++#ifndef WLR_RELAXED_CLIENT_HANDLING
+ 	if (wlr_surface_has_buffer(surface->surface) && !surface->configured) {
+ 		wl_resource_post_error(surface->resource,
+ 			XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER,
+ 			"xdg_surface has never been configured");
+ 		return;
+ 	}
++#endif
+ 
+ 	// surface->role might be NONE for inert popups
+ 	// So we check surface->surface->role
